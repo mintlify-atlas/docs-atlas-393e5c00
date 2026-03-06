@@ -1,0 +1,90 @@
+{
+  "projectType": "infrastructure",
+  "projectName": "Hatch",
+  "projectDescription": "Firecracker-based microVM platform for agentic workloads with REST API, subdomain routing, and serverless wake-on-request.",
+  "theme": "aspen",
+  "primaryColor": "#0EA5E9",
+  "lightColor": "#38BDF8",
+  "darkColor": "#0284C7",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/networking",
+              "concepts/snapshots",
+              "concepts/wake-on-request"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/creating-vms",
+              "guides/networking-setup",
+              "guides/snapshot-restore",
+              "guides/reverse-proxy",
+              "guides/idle-management"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/environment-variables",
+              "configuration/deployment"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "API",
+            "pages": [
+              "api/overview",
+              "api/virtual-machines",
+              "api/snapshots",
+              "api/routes",
+              "api/health"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Firecracker microVM orchestration with REST API",
+    "Subdomain-based reverse proxy with automatic routing",
+    "Wake-on-request serverless pattern for idle VMs",
+    "Snapshot/restore to S3-compatible storage",
+    "Full networking stack with TAP, bridge, and DHCP",
+    "SSH gateway with port forwarding and wake-on-SSH",
+    "Automatic idle detection and snapshot"
+  ],
+  "publicApiSurface": [
+    "POST /vms - Create and start a VM",
+    "GET /vms - List all VMs",
+    "GET /vms/{id} - Get VM details",
+    "DELETE /vms/{id} - Delete VM",
+    "POST /vms/{id}/stop - Stop running VM",
+    "POST /vms/{id}/snapshot - Create snapshot",
+    "POST /vms/{id}/restore - Restore from snapshot",
+    "GET /vms/{id}/snapshots - List VM snapshots",
+    "POST /vms/{id}/routes - Create proxy route",
+    "GET /vms/{id}/routes - List VM routes",
+    "DELETE /routes/{id} - Delete route",
+    "GET /healthz - Health check"
+  ]
+}
