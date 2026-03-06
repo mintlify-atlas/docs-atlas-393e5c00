@@ -214,7 +214,7 @@ The SSH Gateway listens on all active SSH ports. When a connection arrives:
 2. If VM is snapshotted, restore it (client sees slow handshake, ~2-5 seconds)
 3. Once running, create bidirectional TCP pipe to `guest_ip:22`
 
-See [internal/proxy/ssh_gateway.go:149-188](/workspace/source/internal/proxy/ssh_gateway.go) for implementation.
+See [internal/proxy/ssh_gateway.go:149-188](https://github.com/ThakerKush/hatch/blob/main/internal/proxy/ssh_gateway.go#L149-L188) for implementation.
 
 ## cloud-init Network Configuration
 
@@ -247,7 +247,7 @@ users:
 ```
 </CodeGroup>
 
-These files are injected by loop-mounting the rootfs **before** Firecracker starts (see [internal/vmm/cloudinit.go:86-145](/workspace/source/internal/vmm/cloudinit.go)).
+These files are injected by loop-mounting the rootfs **before** Firecracker starts (see [internal/vmm/cloudinit.go:86-145](https://github.com/ThakerKush/hatch/blob/main/internal/vmm/cloudinit.go#L86-L145)).
 
 ## TAP Device Lifecycle
 
@@ -289,7 +289,7 @@ The `IPAllocator` maintains an in-memory map of allocated IPs and cycles through
 - **Algorithm**: Round-robin with skip-if-in-use
 - **Thread-safe**: Protected by `sync.Mutex`
 
-See [internal/vmm/network.go:146-199](/workspace/source/internal/vmm/network.go).
+See [internal/vmm/network.go:146-199](https://github.com/ThakerKush/hatch/blob/main/internal/vmm/network.go#L146-L199).
 
 ### SSH Port Allocator
 
