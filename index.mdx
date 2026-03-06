@@ -1,97 +1,97 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Hatch Documentation"
+description: "Firecracker-based microVM platform for agentic workloads with REST API, subdomain routing, and serverless wake-on-request"
 ---
 
-## Setting up
+# Welcome to Hatch
 
-Get your documentation site up and running in minutes.
+Hatch is a wrapper around Firecracker for spinning up microVMs, designed for agentic workloads. It provides a REST API for lifecycle management, wake-on-request functionality, snapshot/restore for idle VMs, and a subdomain-based reverse proxy.
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get your first VM running in minutes
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
+    Understand how Hatch works
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="API Reference" icon="code" href="/api/overview">
+    Explore the REST API
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Installation" icon="download" href="/installation">
+    Set up Hatch on your infrastructure
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Key Features
 
-Everything you need to create world-class documentation.
+<CardGroup cols={2}>
+  <Card title="MicroVM Orchestration" icon="server">
+    Manage Firecracker microVMs through a simple REST API with full lifecycle control
+  </Card>
+  <Card title="Subdomain Routing" icon="route">
+    Automatic reverse proxy routing to VMs via subdomains with wake-on-request support
+  </Card>
+  <Card title="Serverless Pattern" icon="bolt">
+    Idle VMs automatically snapshot to S3 and wake transparently on next request
+  </Card>
+  <Card title="Full Networking" icon="network-wired">
+    Complete networking stack with TAP devices, bridge, DHCP, and NAT
+  </Card>
+  <Card title="SSH Gateway" icon="terminal">
+    Port forwarding with wake-on-SSH for seamless access to snapshotted VMs
+  </Card>
+  <Card title="Snapshot/Restore" icon="floppy-disk">
+    Full VM state persistence to S3-compatible storage with fast restore
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Quick Example
 
-## Need inspiration?
+Create your first VM with networking and cloud-init:
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+```bash
+curl -X POST http://localhost:8080/vms \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer YOUR_API_KEY' \
+  -d '{
+    "enable_network": true,
+    "user_data": "#cloud-config\nusers:\n  - name: hatch\n    groups: [sudo]\n    shell: /bin/bash\n    sudo: [\"ALL=(ALL) NOPASSWD:ALL\"]\n    ssh_authorized_keys:\n      - ssh-rsa AAAA..."
+  }'
+```
+
+Then SSH into your VM:
+
+```bash
+ssh -p <ssh_port> hatch@<host-ip>
+```
+
+## Use Cases
+
+<CardGroup cols={2}>
+  <Card title="Agentic Workloads" icon="robot">
+    Run autonomous agents in isolated microVMs with automatic scaling
+  </Card>
+  <Card title="Development Environments" icon="laptop-code">
+    Spin up ephemeral dev environments that snapshot when idle
+  </Card>
+  <Card title="CI/CD Runners" icon="gears">
+    Isolated build environments that wake on webhook triggers
+  </Card>
+  <Card title="Testing Infrastructure" icon="flask">
+    Create and destroy test VMs with snapshot/restore for consistent state
+  </Card>
+</CardGroup>
+
+## Get Started
+
+<CardGroup cols={3}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Launch your first VM
+  </Card>
+  <Card title="Core Concepts" icon="book" href="/concepts/architecture">
+    Learn the fundamentals
+  </Card>
+  <Card title="API Docs" icon="terminal" href="/api/overview">
+    Explore the API
+  </Card>
+</CardGroup>

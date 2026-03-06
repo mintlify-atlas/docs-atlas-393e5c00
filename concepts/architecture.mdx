@@ -1,0 +1,184 @@
+---
+title: Architecture
+description: Understanding Hatch's system architecture and core components
+---
+
+## Overview
+
+Hatch is a Firecracker-based microVM platform designed for agentic workloads. It provides a REST API for lifecycle management, wake-on-request capabilities, snapshot/restore for idle VMs, and subdomain-based reverse proxy routing.
+
+<Frame>
+  <img src="/images/architecture.png" alt="Hatch Architecture Diagram" />
+</Frame>
+
+## Core Components
+
+Hatch's architecture consists of several integrated components working together to provide serverless VM capabilities:
+
+<CardGroup cols={2}>
+  <Card title="hatchd" icon="server">
+    Main daemon process that orchestrates all VM operations and exposes the REST API on port 8080
+  </Card>
+  
+  <Card title="VM Manager" icon="microchip">
+    Manages VM lifecycle (create, stop, delete, snapshot, restore) and owns networking singletons
+  </Card>
+  
+  <Card title="Proxy Server" icon="route">
+    Subdomain-based reverse proxy on port 9090 that routes HTTP requests to VMs and handles wake-on-request
+  </Card>
+  
+  <Card title="SSH Gateway" icon="terminal">
+    TCP proxy that forwards SSH connections to VMs and can wake snapshotted VMs on connection attempts
+  </Card>
+  
+  <Card title="PostgreSQL" icon="database">
+    Stores VM metadata, proxy routes, snapshot records, and image catalog
+  </Card>
+  
+  <Card title="S3 Storage" icon="cloud">
+    Stores snapshot artifacts (memory dumps, CPU state, disk deltas) for VM pause/resume
+  </Card>
+</CardGroup>
+
+## Request Flow
+
+### HTTP Request Flow
+
+<Steps>
+  <Step title="Request arrives at proxy">
+    Client sends HTTP request to `my-agent.hatch.local` on port 9090
+  </Step>
+  
+  <Step title="Subdomain extraction">
+    Proxy extracts subdomain (`my-agent`) from Host header and looks up route in database
+  </Step>
+  
+  <Step title="VM state check">
+    Proxy checks VM state:
+    - **Running**: proceed to proxy
+    - **Snapshotted**: wake VM if `auto_wake: true`, then proxy
+    - **Other states**: return error
+  </Step>
+  
+  <Step title="Wake if needed">
+    If VM is snapshotted:
+    - Acquire per-VM mutex to serialize concurrent wake requests
+    - Download snapshot from S3 (memory, vmstate, disk delta)
+    - Reconstruct rootfs from base image + delta
+    - Re-establish networking (TAP device, DHCP, iptables)
+    - Load snapshot into new Firecracker process
+  </Step>
+  
+  <Step title="Reverse proxy">
+    Forward request to `vm_guest_ip:target_port` inside the VM
+  </Step>
+  
+  <Step title="Record access">
+    Update last access timestamp for idle detection
+  </Step>
+</Steps>
+
+### SSH Connection Flow
+
+<Steps>
+  <Step title="Connection arrives">
+    SSH client connects to host port (e.g., 16000)
+  </Step>
+  
+  <Step title="SSH Gateway lookup">
+    Gateway identifies VM by SSH port from database
+  </Step>
+  
+  <Step title="Wake if snapshotted">
+    If VM is snapshotted, restore it before forwarding connection (client sees slow handshake)
+  </Step>
+  
+  <Step title="TCP tunnel">
+    Bidirectional TCP pipe between client and `guest_ip:22`
+  </Step>
+</Steps>
+
+## Data Persistence Layer
+
+### PostgreSQL Schema
+
+The database stores:
+
+- **VMs table**: VM metadata (ID, state, image_id, vcpu_count, mem_mib, guest_ip, guest_mac, ssh_port, work_dir)
+- **Images table**: Base image catalog (kernel path, rootfs path, boot args)
+- **Routes table**: Proxy route mappings (subdomain → vm_id, target_port, auto_wake flag)
+- **Snapshots table**: Snapshot records (S3 keys for memory/vmstate/disk, VM config JSON, size, timestamp)
+
+### S3 Storage Structure
+
+Snapshots are stored in S3-compatible storage with the following structure:
+
+```
+snapshots/
+  {vm_id}/
+    {snapshot_id}/
+      vmstate           # CPU registers and device state (uncompressed)
+      memory.gz         # Full memory dump (gzip compressed)
+      disk.delta.gz     # Block-level diff vs base image (gzip compressed)
+```
+
+### Local Filesystem
+
+Each VM gets a work directory:
+
+```
+{DATA_DIR}/vms/{vm_id}/
+  rootfs.ext4              # Per-VM writable rootfs (copy of base image)
+  firecracker.socket       # Firecracker API socket
+  firecracker.{log,metrics,stdout,stderr}
+  cidata-src/              # Temporary cloud-init seed files
+  snapshots/{snap_id}/     # Local snapshot staging (deleted after S3 upload)
+```
+
+## Component Interactions
+
+<Note>
+  The VM Manager is the central orchestrator. All components interact with it:
+  - **Proxy** calls `vmm.Restore()` for wake-on-HTTP
+  - **SSH Gateway** calls `vmm.Restore()` for wake-on-SSH
+  - **Idle Monitor** calls `vmm.Snapshot()` for auto-pause
+  - **API handlers** call `vmm.CreateAndStart()`, `vmm.Stop()`, `vmm.Delete()`
+</Note>
+
+### Concurrency Control
+
+Hatch uses several synchronization mechanisms:
+
+- **Per-VM wake mutex** (`sync.Map` in proxy and SSH gateway): Prevents concurrent restore operations for the same VM
+- **IP allocator mutex**: Serializes IP allocation from the bridge subnet pool
+- **DHCP server mutex**: Protects dnsmasq hosts file writes and reload signals
+- **SSH port map mutex**: Guards the in-memory SSH port allocation table
+
+## Startup Reconciliation
+
+On startup, the Manager reconciles orphaned resources from previous runs:
+
+<Steps>
+  <Step title="Mark stale VMs">
+    Database: VMs left in "running" or "starting" state → marked as "error"
+  </Step>
+  
+  <Step title="Flush iptables rules">
+    Remove all SSH forwarding rules in the configured port range
+  </Step>
+  
+  <Step title="Delete TAP devices">
+    Remove all `fctap-*` interfaces (no VMs running after restart)
+  </Step>
+  
+  <Step title="Recreate bridge">
+    Delete and recreate `fcbr0` for fresh ARP state
+  </Step>
+  
+  <Step title="Create loop devices">
+    Ensure `/dev/loop0-7` nodes exist for rootfs mounting
+  </Step>
+</Steps>
+
+This ensures Hatch always starts from a clean, known-good state.

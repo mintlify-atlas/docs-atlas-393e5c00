@@ -1,0 +1,600 @@
+---
+title: Production Deployment
+description: Deploy Hatch in production with Docker Compose and systemd
+---
+
+This guide covers deploying Hatch in a production environment with all necessary infrastructure services.
+
+## System Requirements
+
+### Hardware
+
+- **CPU:** x86_64 processor with virtualization support (Intel VT-x or AMD-V)
+- **RAM:** Minimum 4GB, recommended 8GB+ (plus additional memory for VMs)
+- **Storage:** 20GB+ for system and images, plus space for VM snapshots
+- **Network:** Public IP address and domain name for external access
+
+### Software
+
+- **OS:** Linux with kernel 4.14+ (Ubuntu 22.04 LTS or later recommended)
+- **Docker:** Version 20.10+
+- **Docker Compose:** Version 2.0+
+- **Firecracker:** Version 1.0+ ([download from GitHub](https://github.com/firecracker-microvm/firecracker/releases))
+- **KVM:** Kernel module loaded and `/dev/kvm` accessible
+
+### Permissions
+
+<Warning>
+Hatch requires root privileges to create network bridges and manage Firecracker VMs. The systemd service runs as root.
+</Warning>
+
+## DNS Configuration
+
+Before deployment, configure your DNS records:
+
+```
+A       hatchvm.com              → YOUR_SERVER_IP
+A       www.hatchvm.com          → YOUR_SERVER_IP
+A       api.hatchvm.com          → YOUR_SERVER_IP
+CNAME   *.hatchvm.com            → hatchvm.com
+```
+
+The wildcard CNAME enables subdomain routing for individual VMs (e.g., `my-agent.hatchvm.com`).
+
+## Infrastructure Setup
+
+Hatch uses Docker Compose to manage infrastructure services: PostgreSQL, MinIO (S3), and Traefik (reverse proxy).
+
+### 1. Create Environment File
+
+Create a `.env` file in your deployment directory:
+
+```bash
+# Domain Configuration
+HATCH_BASE_DOMAIN=hatchvm.com
+ACME_EMAIL=admin@hatchvm.com
+CF_DNS_API_TOKEN=your-cloudflare-api-token
+
+# Database
+POSTGRES_USER=hatch
+POSTGRES_PASSWORD=CHANGE_THIS_SECURE_PASSWORD
+POSTGRES_DB=hatch
+DATABASE_URL=postgres://hatch:CHANGE_THIS_SECURE_PASSWORD@127.0.0.1:5432/hatch?sslmode=disable
+
+# MinIO S3 Storage
+MINIO_ROOT_USER=admin
+MINIO_ROOT_PASSWORD=CHANGE_THIS_SECURE_PASSWORD
+HATCH_S3_ENDPOINT=http://127.0.0.1:9000
+HATCH_S3_BUCKET=hatch-snapshots
+HATCH_S3_REGION=us-east-1
+HATCH_S3_ACCESS_KEY=admin
+HATCH_S3_SECRET_KEY=CHANGE_THIS_SECURE_PASSWORD
+
+# Hatch API
+HATCH_HTTP_ADDR=127.0.0.1:8080
+HATCH_BETTER_AUTH_VERIFY_URL=http://127.0.0.1:3000/api/auth/api-key/verify
+
+# Hatch Proxy
+HATCH_PROXY_ADDR=127.0.0.1:9090
+HATCH_PROXY_BASE_DOMAIN=hatchvm.com
+
+# Storage
+HATCH_DATA_DIR=/data
+
+# Firecracker
+HATCH_FIRECRACKER_BIN=/root/firecracker/firecracker
+HATCH_DEFAULT_KERNEL_PATH=/root/firecracker/vmlinux-5.10
+HATCH_DEFAULT_ROOTFS_PATH=/root/firecracker/ubuntu-noble-rootfs.ext4
+
+# Network
+HATCH_SSH_ALLOWED_CIDR=0.0.0.0/0
+
+# Idle Management
+HATCH_IDLE_TIMEOUT=45m
+HATCH_IDLE_CHECK_INTERVAL=15m
+
+# Better Auth
+BETTER_AUTH_URL=http://localhost:3000
+BETTER_AUTH_SECRET=GENERATE_A_RANDOM_32_PLUS_CHARACTER_SECRET
+GOOGLE_CLIENT_ID=your-google-oauth-client-id
+GOOGLE_CLIENT_SECRET=your-google-oauth-client-secret
+```
+
+<Warning>
+**Security Critical:** Replace all placeholder passwords and secrets with secure, randomly generated values.
+</Warning>
+
+### 2. Start Infrastructure Services
+
+The included `docker-compose.yml` defines three services:
+
+```bash
+docker compose up -d
+```
+
+This starts:
+
+- **Traefik:** Reverse proxy with automatic SSL certificates via Let's Encrypt
+- **PostgreSQL:** Database for Hatch state and metadata
+- **MinIO:** S3-compatible object storage for VM snapshots
+
+#### Service Details
+
+**Traefik** (Port 80, 443)
+- Handles SSL termination with wildcard certificates
+- Routes `api.hatchvm.com` → Hatch API (:8080)
+- Routes `hatchvm.com` → Web UI (:3000)
+- Routes `*.hatchvm.com` → VM Proxy (:9090)
+- Uses Cloudflare DNS challenge for Let's Encrypt
+
+**PostgreSQL** (Port 5432)
+- Bound to `127.0.0.1` for security
+- Data persisted in `pgdata` volume
+- Health checks ensure availability
+
+**MinIO** (Port 9000, 9001)
+- S3 API on port 9000
+- Web console on port 9001
+- Data persisted in `miniodata` volume
+
+### 3. Create MinIO Bucket
+
+Before starting Hatch, create the snapshot bucket:
+
+```bash
+# Access MinIO console at http://your-server:9001
+# Login with MINIO_ROOT_USER and MINIO_ROOT_PASSWORD
+# Create a bucket named "hatch-snapshots"
+```
+
+Or use the MinIO CLI:
+
+```bash
+mc alias set myminio http://127.0.0.1:9000 admin YOUR_PASSWORD
+mc mb myminio/hatch-snapshots
+```
+
+## Traefik Configuration
+
+The `traefik/dynamic.yml` file configures routing:
+
+```yaml
+http:
+  routers:
+    hatch-api:
+      rule: "Host(`api.hatchvm.com`)"
+      entryPoints:
+        - websecure
+      service: hatch-api
+      priority: 100
+      tls:
+        certResolver: letsencrypt
+        domains:
+          - main: "*.hatchvm.com"
+
+    hatch-web:
+      rule: "Host(`hatchvm.com`) || Host(`www.hatchvm.com`)"
+      entryPoints:
+        - websecure
+      service: hatch-web
+      priority: 50
+      tls:
+        certResolver: letsencrypt
+
+    hatch-vms:
+      rule: "HostRegexp(`.+`)"
+      entryPoints:
+        - websecure
+      service: hatch-proxy
+      priority: 1
+      tls:
+        certResolver: letsencrypt
+        domains:
+          - main: "*.hatchvm.com"
+
+  services:
+    hatch-api:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:8080"
+
+    hatch-proxy:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:9090"
+
+    hatch-web:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:3000"
+```
+
+<Tip>
+Router priorities ensure the API route is matched before the wildcard VM route.
+</Tip>
+
+## Firecracker Setup
+
+### 1. Download Firecracker
+
+```bash
+mkdir -p /root/firecracker
+cd /root/firecracker
+
+# Download Firecracker
+wget https://github.com/firecracker-microvm/firecracker/releases/download/v1.10.2/firecracker-v1.10.2-x86_64.tgz
+tar -xzf firecracker-v1.10.2-x86_64.tgz
+mv release-v1.10.2-x86_64/firecracker-v1.10.2-x86_64 firecracker
+chmod +x firecracker
+```
+
+### 2. Verify KVM Access
+
+```bash
+# Check KVM module is loaded
+lsmod | grep kvm
+
+# Verify /dev/kvm exists
+ls -l /dev/kvm
+```
+
+### 3. Prepare Kernel and Rootfs
+
+Download or build a Linux kernel and root filesystem:
+
+```bash
+# Example: Download a pre-built kernel
+wget https://example.com/vmlinux-5.10 -O /root/firecracker/vmlinux-5.10
+
+# Place your rootfs image
+# This should be an ext4 filesystem image
+cp ubuntu-noble-rootfs.ext4 /root/firecracker/
+```
+
+<Note>
+The kernel and rootfs paths are configured via `HATCH_DEFAULT_KERNEL_PATH` and `HATCH_DEFAULT_ROOTFS_PATH`. Hatch will auto-seed a default image with ID `img_default` when both are set.
+</Note>
+
+## Hatch Daemon Setup
+
+### 1. Build Hatch
+
+```bash
+cd /root/hatch
+go build -o hatchd ./cmd/hatchd
+```
+
+### 2. Run Database Migrations
+
+```bash
+# Ensure DATABASE_URL is set in your .env
+source .env
+
+# Run migrations (if using a migration tool)
+# Or let Hatch auto-migrate on first startup
+./hatchd
+```
+
+### 3. Install Systemd Service
+
+Copy the systemd service file:
+
+```bash
+cp deploy/hatchd.service /etc/systemd/system/
+```
+
+Edit `/etc/systemd/system/hatchd.service` if needed:
+
+```ini
+[Unit]
+Description=Hatch daemon
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/hatch
+EnvironmentFile=/root/hatch/.env
+ExecStart=/root/hatch/hatchd
+Restart=always
+RestartSec=2
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start the service:
+
+```bash
+systemctl daemon-reload
+systemctl enable hatchd
+systemctl start hatchd
+```
+
+Check service status:
+
+```bash
+systemctl status hatchd
+journalctl -u hatchd -f
+```
+
+## Network Configuration
+
+### Firewall Rules
+
+Configure firewall rules to allow necessary traffic:
+
+```bash
+# Allow HTTP/HTTPS (Traefik)
+ufw allow 80/tcp
+ufw allow 443/tcp
+
+# Allow SSH forwarding port range (if exposing SSH publicly)
+ufw allow 16000:26000/tcp
+
+# Allow SSH to host
+ufw allow 22/tcp
+
+ufw enable
+```
+
+<Warning>
+Restrict SSH forwarding ports to trusted networks by adjusting `HATCH_SSH_ALLOWED_CIDR`. The default `0.0.0.0/0` allows access from anywhere.
+</Warning>
+
+### Bridge Network
+
+Hatch creates a network bridge (`fcbr0`) for VM networking. This is handled automatically, but you can customize:
+
+```bash
+# In .env
+HATCH_BRIDGE_NAME=fcbr0
+HATCH_BRIDGE_CIDR=172.16.0.1/24
+```
+
+Verify bridge creation:
+
+```bash
+ip addr show fcbr0
+```
+
+## Security Considerations
+
+### API Authentication
+
+<Warning>
+All API requests must include a valid API key. Configure Better Auth to manage user accounts and API keys.
+</Warning>
+
+The Hatch API uses Better Auth middleware to verify API keys against the verification endpoint:
+
+```bash
+HATCH_BETTER_AUTH_VERIFY_URL=http://127.0.0.1:3000/api/auth/api-key/verify
+```
+
+### Secrets Management
+
+- Store all secrets in `.env` file with restricted permissions: `chmod 600 .env`
+- Use strong, randomly generated passwords for database and S3
+- Rotate API keys and secrets regularly
+- Never commit `.env` to version control
+
+### Network Isolation
+
+- Bind services to `127.0.0.1` when possible (API, proxy, PostgreSQL, MinIO)
+- Use Traefik as the only public-facing service
+- Restrict SSH forwarding CIDR to trusted networks
+- Enable SSL/TLS for all external traffic
+
+### Resource Limits
+
+The systemd service sets `LimitNOFILE=65535` to support many concurrent VMs. Adjust based on your expected load.
+
+## Monitoring and Logs
+
+### Service Logs
+
+View Hatch daemon logs:
+
+```bash
+journalctl -u hatchd -f
+```
+
+View infrastructure logs:
+
+```bash
+docker compose logs -f traefik
+docker compose logs -f postgres
+docker compose logs -f minio
+```
+
+### Health Checks
+
+Verify services are running:
+
+```bash
+# Check Hatch API
+curl http://127.0.0.1:8080/health
+
+# Check PostgreSQL
+docker compose exec postgres pg_isready
+
+# Check MinIO
+curl http://127.0.0.1:9000/minio/health/live
+```
+
+### VM Monitoring
+
+Monitor active VMs:
+
+```bash
+# List running Firecracker processes
+ps aux | grep firecracker
+
+# Check bridge network connections
+bridge link show fcbr0
+```
+
+<Tip>
+Integrate with monitoring tools like Prometheus, Grafana, or your preferred observability stack for production deployments.
+</Tip>
+
+## Backup and Recovery
+
+### Database Backups
+
+Regularly backup PostgreSQL:
+
+```bash
+# Create backup
+docker compose exec postgres pg_dump -U hatch hatch > hatch-backup-$(date +%Y%m%d).sql
+
+# Restore backup
+docker compose exec -T postgres psql -U hatch hatch < hatch-backup-20260306.sql
+```
+
+### S3 Snapshot Backups
+
+MinIO data is stored in the `miniodata` Docker volume. For disaster recovery:
+
+```bash
+# Backup MinIO data
+docker run --rm -v hatch_miniodata:/data -v $(pwd):/backup \
+  alpine tar czf /backup/minio-backup-$(date +%Y%m%d).tar.gz -C /data .
+
+# Restore MinIO data
+docker run --rm -v hatch_miniodata:/data -v $(pwd):/backup \
+  alpine tar xzf /backup/minio-backup-20260306.tar.gz -C /data
+```
+
+Or replicate to external S3:
+
+```bash
+mc mirror myminio/hatch-snapshots s3/backup-bucket/hatch-snapshots
+```
+
+### Configuration Backups
+
+Backup your environment and configuration:
+
+```bash
+tar czf hatch-config-$(date +%Y%m%d).tar.gz .env docker-compose.yml traefik/
+```
+
+## Upgrading
+
+### 1. Backup Current State
+
+```bash
+# Backup database and config
+sh backup.sh
+```
+
+### 2. Update Code
+
+```bash
+cd /root/hatch
+git pull origin main
+```
+
+### 3. Rebuild Binary
+
+```bash
+go build -o hatchd ./cmd/hatchd
+```
+
+### 4. Restart Service
+
+```bash
+systemctl restart hatchd
+journalctl -u hatchd -f
+```
+
+### 5. Update Infrastructure (if needed)
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+## Troubleshooting
+
+### Hatch Won't Start
+
+- Check logs: `journalctl -u hatchd -n 50`
+- Verify environment variables: `systemctl cat hatchd`
+- Ensure PostgreSQL is running: `docker compose ps postgres`
+- Check `/dev/kvm` permissions: `ls -l /dev/kvm`
+
+### VMs Fail to Start
+
+- Verify Firecracker binary path: `ls -l $HATCH_FIRECRACKER_BIN`
+- Check kernel and rootfs paths exist
+- Ensure KVM module is loaded: `lsmod | grep kvm`
+- Review Hatch logs for Firecracker errors
+
+### SSL Certificate Issues
+
+- Verify DNS records are correct: `dig hatchvm.com`
+- Check Traefik logs: `docker compose logs traefik`
+- Ensure Cloudflare API token has DNS edit permissions
+- Wait up to 10 minutes for certificate provisioning
+
+### Database Connection Errors
+
+- Verify PostgreSQL is healthy: `docker compose ps`
+- Check `DATABASE_URL` matches PostgreSQL credentials
+- Test connection: `psql $DATABASE_URL`
+
+### S3 Snapshot Errors
+
+- Verify MinIO is running: `docker compose ps minio`
+- Check bucket exists: `mc ls myminio/hatch-snapshots`
+- Verify S3 credentials in `.env`
+- Review Hatch logs for S3 API errors
+
+## Performance Tuning
+
+### VM Resource Allocation
+
+Adjust default VM resources based on workload:
+
+```bash
+HATCH_DEFAULT_VCPU=2
+HATCH_DEFAULT_MEM_MIB=1024
+```
+
+### Idle Management
+
+Optimize for your usage patterns:
+
+```bash
+# Aggressive pausing for resource savings
+HATCH_IDLE_TIMEOUT=15m
+HATCH_IDLE_CHECK_INTERVAL=5m
+
+# Conservative for low-latency
+HATCH_IDLE_TIMEOUT=2h
+HATCH_IDLE_CHECK_INTERVAL=30m
+```
+
+### Database Performance
+
+For high VM counts, tune PostgreSQL:
+
+```yaml
+# docker-compose.yml
+postgres:
+  command:
+    - "postgres"
+    - "-c"
+    - "max_connections=200"
+    - "-c"
+    - "shared_buffers=256MB"
+```
+
+<Tip>
+Monitor resource usage and adjust VM limits, idle timeouts, and database configuration based on your actual workload.
+</Tip>

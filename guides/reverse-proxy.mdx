@@ -1,0 +1,448 @@
+---
+title: Reverse Proxy & Subdomain Routing
+description: Expose VM services via automatic subdomain routing with auto-wake support
+---
+
+Hatch includes a built-in reverse proxy that routes HTTP traffic from subdomains to VMs. This enables clean URLs like `https://my-app.hatch.example.com` instead of IP:port combinations.
+
+## How the Reverse Proxy Works
+
+The proxy uses subdomain-based routing:
+
+<Steps>
+  <Step title="Client makes request">
+    A request arrives at `https://my-app.hatch.example.com`
+  </Step>
+
+  <Step title="Proxy extracts subdomain">
+    The proxy extracts `my-app` from the Host header.
+  </Step>
+
+  <Step title="Route lookup">
+    The proxy queries the database for a route matching subdomain `my-app`.
+  </Step>
+
+  <Step title="VM state check">
+    If the target VM is `snapshotted` and `auto_wake: true`, the VM is automatically restored.
+  </Step>
+
+  <Step title="Request forwarded">
+    Once the VM is `running`, the request is proxied to `http://{guest_ip}:{target_port}`.
+  </Step>
+</Steps>
+
+## Creating a Proxy Route
+
+Create a route for a running VM:
+
+```bash
+curl -X POST https://api.hatch.example.com/vms/vm-abc123/routes \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "subdomain": "my-app",
+    "target_port": 8080
+  }'
+```
+
+**Response:**
+```json
+{
+  "id": "rt-xyz789",
+  "vm_id": "vm-abc123",
+  "subdomain": "my-app",
+  "target_port": 8080,
+  "auto_wake": true,
+  "created_at": "2026-03-06T14:30:00Z",
+  "updated_at": "2026-03-06T14:30:00Z"
+}
+```
+
+Now HTTP requests to `https://my-app.hatch.example.com` will be forwarded to the VM's port 8080.
+
+<Tip>
+  If you omit the `subdomain` field, Hatch generates a random 12-character subdomain automatically.
+</Tip>
+
+## Subdomain Patterns
+
+### Valid Subdomains
+
+Subdomains must follow these rules:
+- Lowercase alphanumeric characters and hyphens
+- Must start and end with alphanumeric (not hyphen)
+- Maximum 63 characters
+- Cannot be a reserved subdomain
+
+<CodeGroup>
+```bash Valid examples
+"my-app"       ✓
+"prod-api"     ✓
+"web-1"        ✓
+"staging"      ✓
+"app-2024-v2"  ✓
+```
+
+```bash Invalid examples
+"MyApp"        ✗ (uppercase)
+"my_app"       ✗ (underscore)
+"-myapp"       ✗ (starts with hyphen)
+"my..app"      ✗ (double dots)
+"my.app"       ✗ (dot)
+```
+</CodeGroup>
+
+### Reserved Subdomains
+
+These subdomains are reserved and cannot be used:
+
+```
+api, www, admin, app, dashboard, mail, smtp, ftp, ssh,
+ns1, ns2, status, docs, help, support, billing, login,
+auth, oauth, cdn, static, assets, media, hatch, console,
+panel, grafana, prometheus, traefik, minio, postgres,
+db, redis, internal
+```
+
+**Error when using reserved subdomain:**
+```json
+{
+  "error": "subdomain \"api\" is reserved"
+}
+```
+
+### Random Subdomains
+
+Omit the `subdomain` field to get an auto-generated unique subdomain:
+
+```bash
+curl -X POST https://api.hatch.example.com/vms/vm-abc123/routes \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "target_port": 3000
+  }'
+```
+
+**Response with random subdomain:**
+```json
+{
+  "id": "rt-xyz789",
+  "subdomain": "x7k9m2p5n8q1",
+  "target_port": 3000,
+  "auto_wake": true
+}
+```
+
+## Auto-Wake Configuration
+
+The `auto_wake` field controls whether snapshotted VMs are automatically restored on incoming requests.
+
+### Enabled (default)
+
+```bash
+curl -X POST https://api.hatch.example.com/vms/vm-abc123/routes \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "subdomain": "my-app",
+    "target_port": 8080,
+    "auto_wake": true
+  }'
+```
+
+**Behavior:**
+1. Request arrives for `my-app.hatch.example.com`
+2. VM is in `snapshotted` state
+3. Proxy automatically calls `POST /vms/vm-abc123/restore`
+4. VM transitions to `running` (2-10 seconds)
+5. Request is forwarded to the VM
+
+<Note>
+  The first request after a snapshot will have higher latency (restore time). Subsequent requests are instant. The proxy serializes concurrent restore requests to avoid redundant operations.
+</Note>
+
+### Disabled
+
+```bash
+curl -X POST https://api.hatch.example.com/vms/vm-abc123/routes \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "subdomain": "critical-app",
+    "target_port": 8080,
+    "auto_wake": false
+  }'
+```
+
+**Behavior:**
+1. Request arrives for `critical-app.hatch.example.com`
+2. VM is in `snapshotted` state
+3. Proxy returns `503 Service Unavailable` immediately
+4. VM remains snapshotted
+
+**Response to client:**
+```json
+{
+  "error": "vm is snapshotted and auto-wake is disabled"
+}
+```
+
+<Warning>
+  Disable auto-wake for production VMs that must always be running. Use [idle management](/guides/idle-management) carefully to avoid unwanted snapshots.
+</Warning>
+
+## Multiple Routes Per VM
+
+A single VM can have multiple proxy routes for different services:
+
+```bash
+# Route 1: Web interface
+curl -X POST https://api.hatch.example.com/vms/vm-abc123/routes \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "subdomain": "web",
+    "target_port": 80
+  }'
+
+# Route 2: API backend
+curl -X POST https://api.hatch.example.com/vms/vm-abc123/routes \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "subdomain": "api",
+    "target_port": 8080
+  }'
+
+# Route 3: Metrics endpoint
+curl -X POST https://api.hatch.example.com/vms/vm-abc123/routes \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "subdomain": "metrics",
+    "target_port": 9090
+  }'
+```
+
+<Tip>
+  All routes share the same VM lifecycle. If the VM is snapshotted, any route with `auto_wake: true` can trigger a restore.
+</Tip>
+
+## Listing Routes
+
+### All routes for a VM
+
+```bash
+curl https://api.hatch.example.com/vms/vm-abc123/routes \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+**Response:**
+```json
+[
+  {
+    "id": "rt-xyz789",
+    "vm_id": "vm-abc123",
+    "subdomain": "my-app",
+    "target_port": 8080,
+    "auto_wake": true,
+    "created_at": "2026-03-06T14:30:00Z"
+  },
+  {
+    "id": "rt-abc456",
+    "vm_id": "vm-abc123",
+    "subdomain": "my-api",
+    "target_port": 3000,
+    "auto_wake": false,
+    "created_at": "2026-03-06T10:15:00Z"
+  }
+]
+```
+
+## Deleting Routes
+
+Remove a proxy route by its ID:
+
+```bash
+curl -X DELETE https://api.hatch.example.com/routes/rt-xyz789 \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+**Response:**
+```json
+{
+  "status": "deleted"
+}
+```
+
+<Note>
+  Deleting a route does **not** affect the VM. The VM continues running, but the subdomain will no longer route to it.
+</Note>
+
+## Custom Domain Setup
+
+To use your own domain (e.g., `*.example.com`) instead of the Hatch base domain:
+
+<Steps>
+  <Step title="Configure DNS wildcard record">
+    Add a wildcard A or CNAME record pointing to your Hatch host:
+
+    ```
+    *.hatch.example.com  A  203.0.113.10
+    ```
+
+    Or using CNAME:
+
+    ```
+    *.hatch.example.com  CNAME  hatch-host.example.com
+    ```
+  </Step>
+
+  <Step title="Configure Hatch base domain">
+    Set the `HATCH_BASE_DOMAIN` environment variable:
+
+    ```bash
+    export HATCH_BASE_DOMAIN=hatch.example.com
+    ```
+
+    Restart Hatch for the change to take effect.
+  </Step>
+
+  <Step title="Create routes as normal">
+    Routes will now use your custom domain:
+
+    ```bash
+    curl -X POST https://api.hatch.example.com/vms/vm-abc123/routes \
+      -H "Authorization: Bearer YOUR_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "subdomain": "my-app",
+        "target_port": 8080
+      }'
+    ```
+
+    Access at: `https://my-app.hatch.example.com`
+  </Step>
+</Steps>
+
+<Tip>
+  You'll also need a reverse proxy (nginx, Caddy, Traefik) in front of Hatch to handle TLS termination. The Hatch proxy speaks HTTP only.
+</Tip>
+
+## Proxy Behavior
+
+### Host Header Preservation
+
+The original `Host` header is preserved when forwarding requests:
+
+```
+Client request:     Host: my-app.hatch.example.com
+Proxied request:    Host: my-app.hatch.example.com
+```
+
+This allows applications to generate correct URLs and handle virtual hosting.
+
+### Request Timeout
+
+Requests wait up to 30 seconds for auto-wake to complete (configurable via `HATCH_PROXY_WAKE_TIMEOUT`).
+
+If restore takes longer:
+```json
+{
+  "error": "failed to wake vm"
+}
+```
+
+### Error Responses
+
+| Error | Status | Cause |
+|-------|--------|-------|
+| `no subdomain in host header` | 502 | Host header missing or malformed |
+| `no route for subdomain "x"` | 502 | No route exists for subdomain |
+| `vm not found` | 502 | Route exists but VM was deleted |
+| `vm is snapshotted and auto-wake is disabled` | 503 | VM snapshotted, auto-wake off |
+| `failed to wake vm` | 503 | Restore operation failed |
+| `vm is in state "error", not proxying` | 503 | VM in error state |
+| `vm has no guest IP` | 502 | VM has networking disabled |
+
+## Idle Tracking
+
+The proxy tracks the last request time for each subdomain. This data is used by the [idle monitor](/guides/idle-management) to determine when to snapshot inactive VMs.
+
+**Access tracking:**
+- Every successful proxy request updates the `last_access` timestamp for the subdomain
+- VMs with proxy routes are considered active if they've received requests within the idle timeout
+- VMs without recent proxy traffic are candidates for automatic snapshotting
+
+<Note>
+  SSH connections are tracked separately via netfilter conntrack, not via proxy access times.
+</Note>
+
+## Best Practices
+
+<Steps>
+  <Step title="Use descriptive subdomain names">
+    Choose subdomains that reflect the service or environment:
+
+    ```bash
+    prod-api, staging-web, dev-dashboard, qa-frontend
+    ```
+  </Step>
+
+  <Step title="Enable auto-wake for dev/staging">
+    Save costs by letting idle dev VMs snapshot automatically:
+
+    ```json
+    {
+      "subdomain": "dev-app",
+      "target_port": 8080,
+      "auto_wake": true
+    }
+    ```
+  </Step>
+
+  <Step title="Disable auto-wake for production">
+    Keep production VMs always running:
+
+    ```json
+    {
+      "subdomain": "prod-api",
+      "target_port": 8080,
+      "auto_wake": false
+    }
+    ```
+  </Step>
+
+  <Step title="Use multiple routes for complex apps">
+    Route different ports for frontend, backend, and admin panels:
+
+    ```bash
+    # Frontend
+    POST /vms/vm-abc123/routes {"subdomain": "app", "target_port": 80}
+
+    # API
+    POST /vms/vm-abc123/routes {"subdomain": "api", "target_port": 8080}
+
+    # Admin
+    POST /vms/vm-abc123/routes {"subdomain": "admin", "target_port": 9000}
+    ```
+  </Step>
+</Steps>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Idle Management" icon="clock" href="/guides/idle-management">
+    Configure automatic snapshots based on proxy traffic
+  </Card>
+  <Card title="Snapshots" icon="camera" href="/guides/snapshot-restore">
+    Understand how auto-wake restores VMs
+  </Card>
+  <Card title="Creating VMs" icon="plus" href="/guides/creating-vms">
+    Learn about VM networking requirements
+  </Card>
+  <Card title="Network Setup" icon="network-wired" href="/guides/networking-setup">
+    Configure VMs for HTTP traffic
+  </Card>
+</CardGroup>

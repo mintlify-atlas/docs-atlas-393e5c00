@@ -1,0 +1,114 @@
+---
+title: 'Health Check'
+description: 'Monitor API server health'
+---
+
+## Health Check Endpoint
+
+<api method="GET" path="/healthz" />
+
+Check the health status of the Hatch API server. This endpoint returns basic operational statistics.
+
+<Note>
+  The health endpoint does **not** require authentication. It can be used for monitoring and load balancer health checks.
+</Note>
+
+### Response
+
+<ResponseField name="status" type="string">
+  Always returns `ok` when the server is operational.
+</ResponseField>
+
+<ResponseField name="vm_count" type="integer">
+  Total number of VMs currently managed by the system.
+</ResponseField>
+
+<ResponseField name="route_count" type="integer">
+  Total number of proxy routes configured.
+</ResponseField>
+
+### Example Request
+
+```bash
+curl http://localhost:8080/healthz
+```
+
+### Example Response
+
+```json
+{
+  "status": "ok",
+  "vm_count": 15,
+  "route_count": 23
+}
+```
+
+---
+
+## Using for Monitoring
+
+The health endpoint is ideal for:
+
+- **Load balancer health checks** - Configure your load balancer to poll `/healthz`
+- **Monitoring systems** - Use with Prometheus, Datadog, or other monitoring tools
+- **Container orchestration** - Kubernetes liveness/readiness probes
+- **Uptime monitoring** - External services like UptimeRobot
+
+### Kubernetes Example
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hatch-api
+spec:
+  containers:
+  - name: hatch
+    image: hatch:latest
+    ports:
+    - containerPort: 8080
+    livenessProbe:
+      httpGet:
+        path: /healthz
+        port: 8080
+      initialDelaySeconds: 10
+      periodSeconds: 30
+    readinessProbe:
+      httpGet:
+        path: /healthz
+        port: 8080
+      initialDelaySeconds: 5
+      periodSeconds: 10
+```
+
+### Docker Compose Healthcheck
+
+```yaml
+services:
+  hatch-api:
+    image: hatch:latest
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+```
+
+### Prometheus Monitoring
+
+You can scrape the VM and route counts as metrics:
+
+```yaml
+scrape_configs:
+  - job_name: 'hatch'
+    metrics_path: '/healthz'
+    static_configs:
+      - targets: ['localhost:8080']
+```
+
+<Tip>
+  While the health endpoint provides basic statistics, consider implementing a custom metrics endpoint for more detailed operational data (CPU usage, memory, disk I/O, etc.).
+</Tip>

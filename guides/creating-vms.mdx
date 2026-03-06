@@ -1,0 +1,311 @@
+---
+title: Creating VMs
+description: Learn how to create, manage, and delete microVMs with the Hatch API
+---
+
+This guide walks you through creating and managing microVMs using the Hatch API.
+
+## Creating a Basic VM
+
+<Steps>
+  <Step title="Create a minimal VM">
+    The simplest way to create a VM is with an empty POST request. Hatch will use the default image and configuration:
+
+    ```bash
+    curl -X POST https://api.hatch.example.com/vms \
+      -H "Authorization: Bearer YOUR_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{}'
+    ```
+
+    <Note>
+      When no `image_id` is provided, Hatch uses the default image configured via `HATCH_DEFAULT_KERNEL_PATH` and `HATCH_DEFAULT_ROOTFS_PATH` environment variables.
+    </Note>
+  </Step>
+
+  <Step title="Review the response">
+    The API returns the created VM object:
+
+    ```json
+    {
+      "id": "vm-abc123",
+      "image_id": "img-default",
+      "state": "running",
+      "vcpu_count": 1,
+      "mem_mib": 512,
+      "guest_ip": "192.168.241.10",
+      "guest_mac": "02:fc:00:00:00:01",
+      "ssh_port": 2200,
+      "enable_network": true,
+      "created_at": "2026-03-06T10:30:00Z",
+      "updated_at": "2026-03-06T10:30:00Z"
+    }
+    ```
+  </Step>
+
+  <Step title="Verify the VM is running">
+    Check the VM status using the returned ID:
+
+    ```bash
+    curl https://api.hatch.example.com/vms/vm-abc123 \
+      -H "Authorization: Bearer YOUR_API_KEY"
+    ```
+  </Step>
+</Steps>
+
+## Creating a Networked VM with Cloud-Init
+
+For production workloads, you'll typically want to customize the VM with cloud-init user data:
+
+<Steps>
+  <Step title="Prepare your cloud-init configuration">
+    Create a cloud-init user data script. This example installs packages and sets up an SSH key:
+
+    ```yaml
+    #cloud-config
+    users:
+      - name: ubuntu
+        sudo: ALL=(ALL) NOPASSWD:ALL
+        ssh_authorized_keys:
+          - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... user@example.com
+    
+    packages:
+      - nginx
+      - git
+    
+    runcmd:
+      - systemctl enable nginx
+      - systemctl start nginx
+    ```
+  </Step>
+
+  <Step title="Create the VM with user data">
+    ```bash
+    curl -X POST https://api.hatch.example.com/vms \
+      -H "Authorization: Bearer YOUR_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "vcpu_count": 2,
+        "mem_mib": 2048,
+        "user_data": "#cloud-config\nusers:\n  - name: ubuntu\n    sudo: ALL=(ALL) NOPASSWD:ALL\n    ssh_authorized_keys:\n      - ssh-ed25519 AAAAC3Nza...\npackages:\n  - nginx\n  - git\nruncmd:\n  - systemctl enable nginx\n  - systemctl start nginx"
+      }'
+    ```
+
+    <Tip>
+      Cloud-init user data is automatically injected into the VM's rootfs as a NoCloud seed during creation. The VM will process this data on first boot.
+    </Tip>
+  </Step>
+
+  <Step title="Connect via SSH">
+    Use the allocated SSH port from the response:
+
+    ```bash
+    ssh ubuntu@hatch-host.example.com -p 2200
+    ```
+  </Step>
+</Steps>
+
+## Custom Resource Allocation
+
+You can specify CPU, memory, and network configuration:
+
+```bash
+curl -X POST https://api.hatch.example.com/vms \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vcpu_count": 4,
+    "mem_mib": 4096,
+    "guest_ip": "192.168.241.50",
+    "guest_mac": "02:fc:00:00:00:32",
+    "enable_network": true
+  }'
+```
+
+<Warning>
+  **Resource Limits**
+  - `vcpu_count`: 1-32 CPUs (defaults to 1)
+  - `mem_mib`: 128-65536 MB (defaults to 512)
+  - Custom IPs must be within the bridge CIDR range
+</Warning>
+
+## Using Templates
+
+Templates let you pre-configure VM settings for reuse:
+
+<CodeGroup>
+```bash Create from template
+curl -X POST https://api.hatch.example.com/vms \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "template_id": "tpl-web-server"
+  }'
+```
+
+```bash Override template values
+curl -X POST https://api.hatch.example.com/vms \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "template_id": "tpl-web-server",
+    "vcpu_count": 2,
+    "mem_mib": 2048
+  }'
+```
+</CodeGroup>
+
+<Note>
+  When using a template, any explicit request values override the template defaults. Template values for `image_id`, `vcpu_count`, `mem_mib`, and `user_data` are used when not specified in the request.
+</Note>
+
+## Disabling Networking
+
+For isolated workloads, you can disable networking:
+
+```bash
+curl -X POST https://api.hatch.example.com/vms \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "enable_network": false,
+    "vcpu_count": 1,
+    "mem_mib": 512
+  }'
+```
+
+VMs without networking will not have:
+- Guest IP allocation
+- TAP device
+- DHCP reservation
+- SSH port forwarding
+
+## Listing VMs
+
+Retrieve all VMs in your account:
+
+```bash
+curl https://api.hatch.example.com/vms \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+**Response:**
+```json
+[
+  {
+    "id": "vm-abc123",
+    "state": "running",
+    "vcpu_count": 2,
+    "mem_mib": 2048,
+    "guest_ip": "192.168.241.10",
+    "ssh_port": 2200,
+    "created_at": "2026-03-06T10:30:00Z"
+  },
+  {
+    "id": "vm-def456",
+    "state": "snapshotted",
+    "vcpu_count": 1,
+    "mem_mib": 512,
+    "guest_ip": "192.168.241.11",
+    "ssh_port": 2201,
+    "created_at": "2026-03-06T09:15:00Z"
+  }
+]
+```
+
+## Stopping VMs
+
+Gracefully shut down a running VM:
+
+```bash
+curl -X POST https://api.hatch.example.com/vms/vm-abc123/stop \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+<Steps>
+  <Step title="VM receives shutdown signal">
+    Firecracker sends a graceful shutdown signal to the guest OS.
+  </Step>
+  
+  <Step title="State transitions to 'stopped'">
+    The VM state changes from `running` → `stopping` → `stopped`.
+  </Step>
+  
+  <Step title="Resources are cleaned up">
+    SSH forwarding rules are removed, but IP allocation and work directory are retained.
+  </Step>
+</Steps>
+
+## Deleting VMs
+
+Permanently remove a VM and all associated resources:
+
+```bash
+curl -X DELETE https://api.hatch.example.com/vms/vm-abc123 \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+<Warning>
+  **Deletion is permanent!** This operation:
+  - Stops the Firecracker process
+  - Removes TAP device and iptables rules
+  - Releases IP allocation and SSH port
+  - Deletes the work directory (rootfs copy, logs)
+  - Removes all proxy routes
+  - Deletes all snapshots from S3 storage
+</Warning>
+
+**Response:**
+```json
+{
+  "status": "deleted"
+}
+```
+
+## VM States
+
+VMs transition through these states during their lifecycle:
+
+| State | Description |
+|-------|-------------|
+| `starting` | VM is being created and Firecracker is launching |
+| `running` | VM is active and responding |
+| `stopping` | VM is shutting down gracefully |
+| `stopped` | VM has been stopped but resources are retained |
+| `snapshotted` | VM has been paused and saved to S3 storage |
+| `error` | VM encountered an error during operation |
+
+<Tip>
+  After a Hatch server restart, any VMs in transient states (`starting`, `running`, `stopping`) are automatically marked as `error` since their Firecracker processes no longer exist.
+</Tip>
+
+## Common Request Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `image_id` | string | default image | Base OS image to use |
+| `template_id` | string | - | Template to inherit settings from |
+| `vcpu_count` | int | 1 | Number of virtual CPUs (1-32) |
+| `mem_mib` | int | 512 | Memory in MiB (128-65536) |
+| `boot_args` | string | image default | Custom kernel boot arguments |
+| `enable_network` | bool | true | Enable networking and SSH |
+| `guest_ip` | string | auto-assigned | Static IP within bridge CIDR |
+| `guest_mac` | string | auto-generated | Static MAC address |
+| `user_data` | string | - | Cloud-init user data (YAML) |
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Network Setup" icon="network-wired" href="/guides/networking-setup">
+    Configure networking, DNS, and internet access
+  </Card>
+  <Card title="Snapshots" icon="camera" href="/guides/snapshot-restore">
+    Save and restore VM state with snapshots
+  </Card>
+  <Card title="Reverse Proxy" icon="route" href="/guides/reverse-proxy">
+    Expose VMs via subdomain routing
+  </Card>
+  <Card title="Idle Management" icon="clock" href="/guides/idle-management">
+    Auto-snapshot idle VMs to save resources
+  </Card>
+</CardGroup>

@@ -1,0 +1,379 @@
+---
+title: Environment Variables
+description: Complete reference for all Hatch environment variables
+---
+
+Hatch is configured entirely through environment variables. This page documents all available configuration options.
+
+## Database
+
+<ParamField path="DATABASE_URL" type="string" required>
+  PostgreSQL connection string in the format `postgres://user:password@host:port/database?sslmode=disable`
+  
+  **Default:** `postgres://hatch:hatch@localhost:5432/hatch?sslmode=disable`
+  
+  **Example:** `postgres://hatch:hatch@127.0.0.1:5432/hatch?sslmode=disable`
+</ParamField>
+
+## HTTP API
+
+<ParamField path="HATCH_HTTP_ADDR" type="string">
+  Address and port for the Hatch REST API server
+  
+  **Default:** `:8080`
+  
+  **Example:** `127.0.0.1:8080`
+</ParamField>
+
+<ParamField path="HATCH_BETTER_AUTH_VERIFY_URL" type="string">
+  Better Auth API key verification endpoint used by hatchd middleware for authentication
+  
+  **Default:** `http://127.0.0.1:3000/api/auth/api-key/verify`
+  
+  **Example:** `http://127.0.0.1:3000/api/auth/api-key/verify`
+</ParamField>
+
+<ParamField path="HATCH_BASE_DOMAIN" type="string" required>
+  Base domain for the Hatch deployment. Used for VM subdomain routing.
+  
+  **Example:** `hatchvm.com`
+  
+  <Warning>This must match your DNS configuration and Traefik certificate resolver setup.</Warning>
+</ParamField>
+
+## Reverse Proxy
+
+<ParamField path="HATCH_PROXY_ADDR" type="string">
+  Address and port for the reverse proxy that routes traffic to VMs
+  
+  **Default:** `:9090`
+  
+  **Example:** `127.0.0.1:9090`
+</ParamField>
+
+<ParamField path="HATCH_PROXY_BASE_DOMAIN" type="string">
+  Domain suffix for VM subdomain routing. When a request comes to `my-agent.hatchvm.com`, it routes to the corresponding VM.
+  
+  **Default:** `hatch.local`
+  
+  **Example:** `${HATCH_BASE_DOMAIN}` or `hatchvm.com`
+</ParamField>
+
+<ParamField path="HATCH_PROXY_WAKE_TIMEOUT" type="duration">
+  Maximum time to wait for a paused VM to wake up when receiving a proxy request
+  
+  **Default:** `60s`
+  
+  **Example:** `30s`, `2m`
+</ParamField>
+
+## Data Storage
+
+<ParamField path="HATCH_DATA_DIR" type="string">
+  Directory for storing VM-related data, snapshots, and runtime files
+  
+  **Default:** `./data`
+  
+  **Example:** `/data` or `/var/lib/hatch`
+</ParamField>
+
+## S3 Snapshot Storage
+
+Hatch uses S3-compatible storage for VM snapshots. MinIO is recommended for local deployments.
+
+<ParamField path="HATCH_S3_ENDPOINT" type="string">
+  S3-compatible endpoint URL for snapshot storage
+  
+  **Example:** `http://127.0.0.1:9000`
+  
+  <Note>Required for snapshot functionality. Leave empty to disable S3 snapshots.</Note>
+</ParamField>
+
+<ParamField path="HATCH_S3_BUCKET" type="string">
+  S3 bucket name for storing VM snapshots
+  
+  **Example:** `hatch-snapshots`
+  
+  <Note>The bucket must exist before starting Hatch. S3 functionality is enabled only when this is set.</Note>
+</ParamField>
+
+<ParamField path="HATCH_S3_REGION" type="string">
+  S3 region for the bucket
+  
+  **Default:** `us-east-1`
+  
+  **Example:** `us-east-1` (for MinIO, this can be any value)
+</ParamField>
+
+<ParamField path="HATCH_S3_ACCESS_KEY" type="string">
+  S3 access key ID for authentication
+  
+  **Example:** `minioadmin`
+  
+  <Warning>Keep this credential secure. Do not commit to version control.</Warning>
+</ParamField>
+
+<ParamField path="HATCH_S3_SECRET_KEY" type="string">
+  S3 secret access key for authentication
+  
+  **Example:** `minioadmin`
+  
+  <Warning>Keep this credential secure. Do not commit to version control.</Warning>
+</ParamField>
+
+## Firecracker Configuration
+
+<ParamField path="HATCH_FIRECRACKER_BIN" type="string">
+  Path to the Firecracker binary executable
+  
+  **Default:** `firecracker`
+  
+  **Example:** `/root/firecracker/firecracker`
+</ParamField>
+
+<ParamField path="HATCH_DEFAULT_KERNEL_PATH" type="string">
+  Path to the default Linux kernel image for VMs
+  
+  **Example:** `/root/firecracker/vmlinux-5.10`
+  
+  <Note>When both `HATCH_DEFAULT_KERNEL_PATH` and `HATCH_DEFAULT_ROOTFS_PATH` are set, Hatch auto-seeds a default image with ID `img_default`.</Note>
+</ParamField>
+
+<ParamField path="HATCH_DEFAULT_ROOTFS_PATH" type="string">
+  Path to the default root filesystem image for VMs
+  
+  **Example:** `/root/firecracker/ubuntu-noble-rootfs.ext4`
+  
+  <Note>Must be an ext4 filesystem image compatible with your kernel.</Note>
+</ParamField>
+
+<ParamField path="HATCH_DEFAULT_VCPU" type="integer">
+  Default number of virtual CPUs for new VMs
+  
+  **Default:** `1`
+  
+  **Example:** `2`
+</ParamField>
+
+<ParamField path="HATCH_DEFAULT_MEM_MIB" type="integer">
+  Default memory allocation in MiB for new VMs
+  
+  **Default:** `512`
+  
+  **Example:** `1024`
+</ParamField>
+
+<ParamField path="HATCH_DEFAULT_BOOT_ARGS" type="string">
+  Default kernel boot arguments for VMs
+  
+  **Default:** `console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw rootfstype=ext4`
+</ParamField>
+
+## Networking
+
+<ParamField path="HATCH_BRIDGE_NAME" type="string">
+  Name of the network bridge interface for VM networking
+  
+  **Default:** `fcbr0`
+</ParamField>
+
+<ParamField path="HATCH_BRIDGE_CIDR" type="string">
+  CIDR notation for the bridge network
+  
+  **Default:** `172.16.0.1/24`
+  
+  **Example:** `10.0.0.1/24`
+</ParamField>
+
+<ParamField path="HATCH_SSH_ALLOWED_CIDR" type="string">
+  CIDR range allowed to access SSH forwarding ports
+  
+  **Default:** `127.0.0.1/32` (localhost only)
+  
+  **Example:** `0.0.0.0/0` (allow all - not recommended for production)
+  
+  <Warning>Restricting SSH access is critical for security. Only allow trusted networks.</Warning>
+</ParamField>
+
+<ParamField path="HATCH_SSH_PORT_MIN" type="integer">
+  Minimum port number for SSH forwarding port range
+  
+  **Default:** `16000`
+</ParamField>
+
+<ParamField path="HATCH_SSH_PORT_MAX" type="integer">
+  Maximum port number for SSH forwarding port range
+  
+  **Default:** `26000`
+  
+  <Note>This range allows up to 10,000 concurrent VMs with SSH forwarding.</Note>
+</ParamField>
+
+## Idle Management
+
+Hatch automatically pauses VMs that have been idle to save resources.
+
+<ParamField path="HATCH_IDLE_TIMEOUT" type="duration">
+  Duration of inactivity before a VM is considered idle and automatically paused
+  
+  **Default:** `45m`
+  
+  **Example:** `30m`, `1h`, `2h30m`
+  
+  <Tip>Set to `0` to disable automatic pausing. Adjust based on your usage patterns and resource constraints.</Tip>
+</ParamField>
+
+<ParamField path="HATCH_IDLE_CHECK_INTERVAL" type="duration">
+  How often the idle monitor checks for inactive VMs
+  
+  **Default:** `5m`
+  
+  **Example:** `15m`, `10m`
+  
+  <Tip>Lower intervals provide faster response but use more CPU. Recommended to be at least 5-10 minutes.</Tip>
+</ParamField>
+
+## Better Auth (Web Application)
+
+These variables configure the web application's authentication system.
+
+<ParamField path="BETTER_AUTH_URL" type="string">
+  Base URL for the Better Auth web application
+  
+  **Default:** `http://localhost:3000`
+  
+  **Example:** `http://localhost:3000`
+</ParamField>
+
+<ParamField path="BETTER_AUTH_SECRET" type="string" required>
+  Secret key for Better Auth session encryption
+  
+  **Example:** `replace-with-32-plus-char-secret`
+  
+  <Warning>Must be at least 32 characters. Generate a secure random string for production.</Warning>
+</ParamField>
+
+<ParamField path="GOOGLE_CLIENT_ID" type="string">
+  Google OAuth client ID for authentication
+  
+  **Example:** `replace-with-google-client-id`
+  
+  <Note>Required only if using Google OAuth for authentication.</Note>
+</ParamField>
+
+<ParamField path="GOOGLE_CLIENT_SECRET" type="string">
+  Google OAuth client secret
+  
+  **Example:** `replace-with-google-client-secret`
+  
+  <Warning>Keep this credential secure. Do not commit to version control.</Warning>
+</ParamField>
+
+## Docker Compose Variables
+
+These variables are used by the Docker Compose setup for infrastructure services.
+
+<ParamField path="CF_DNS_API_TOKEN" type="string">
+  Cloudflare API token for DNS challenge in Let's Encrypt certificate generation
+  
+  <Note>Required for wildcard SSL certificates. See [Deployment](/configuration/deployment) for setup details.</Note>
+</ParamField>
+
+<ParamField path="ACME_EMAIL" type="string">
+  Email address for Let's Encrypt certificate notifications
+  
+  **Example:** `admin@hatchvm.com`
+</ParamField>
+
+<ParamField path="POSTGRES_USER" type="string">
+  PostgreSQL database user
+  
+  **Default:** `hatch`
+</ParamField>
+
+<ParamField path="POSTGRES_PASSWORD" type="string">
+  PostgreSQL database password
+  
+  **Default:** `hatch`
+  
+  <Warning>Change the default password in production.</Warning>
+</ParamField>
+
+<ParamField path="POSTGRES_DB" type="string">
+  PostgreSQL database name
+  
+  **Default:** `hatch`
+</ParamField>
+
+<ParamField path="MINIO_ROOT_USER" type="string">
+  MinIO root username
+  
+  **Default:** `minioadmin`
+  
+  <Warning>Change the default credentials in production.</Warning>
+</ParamField>
+
+<ParamField path="MINIO_ROOT_PASSWORD" type="string">
+  MinIO root password
+  
+  **Default:** `minioadmin`
+  
+  <Warning>Change the default credentials in production.</Warning>
+</ParamField>
+
+## Example Configuration
+
+Here's a complete example `.env` file for a production deployment:
+
+```bash
+# Database
+DATABASE_URL=postgres://hatch:SECURE_PASSWORD@127.0.0.1:5432/hatch?sslmode=disable
+
+# Domain
+HATCH_BASE_DOMAIN=hatchvm.com
+
+# HTTP API
+HATCH_HTTP_ADDR=127.0.0.1:8080
+HATCH_BETTER_AUTH_VERIFY_URL=http://127.0.0.1:3000/api/auth/api-key/verify
+
+# Reverse Proxy
+HATCH_PROXY_ADDR=127.0.0.1:9090
+HATCH_PROXY_BASE_DOMAIN=hatchvm.com
+
+# Storage
+HATCH_DATA_DIR=/data
+HATCH_S3_ENDPOINT=http://127.0.0.1:9000
+HATCH_S3_BUCKET=hatch-snapshots
+HATCH_S3_REGION=us-east-1
+HATCH_S3_ACCESS_KEY=SECURE_ACCESS_KEY
+HATCH_S3_SECRET_KEY=SECURE_SECRET_KEY
+
+# Firecracker
+HATCH_FIRECRACKER_BIN=/root/firecracker/firecracker
+HATCH_DEFAULT_KERNEL_PATH=/root/firecracker/vmlinux-5.10
+HATCH_DEFAULT_ROOTFS_PATH=/root/firecracker/ubuntu-noble-rootfs.ext4
+
+# Network Security
+HATCH_SSH_ALLOWED_CIDR=10.0.0.0/8
+
+# Idle Management
+HATCH_IDLE_TIMEOUT=45m
+HATCH_IDLE_CHECK_INTERVAL=15m
+
+# Better Auth
+BETTER_AUTH_URL=http://localhost:3000
+BETTER_AUTH_SECRET=GENERATE_A_SECURE_32_PLUS_CHARACTER_SECRET_HERE
+GOOGLE_CLIENT_ID=your-google-client-id
+GOOGLE_CLIENT_SECRET=your-google-client-secret
+
+# Docker Compose
+CF_DNS_API_TOKEN=your-cloudflare-token
+ACME_EMAIL=admin@hatchvm.com
+POSTGRES_PASSWORD=SECURE_PASSWORD
+MINIO_ROOT_USER=admin
+MINIO_ROOT_PASSWORD=SECURE_PASSWORD
+```
+
+<Warning>
+Replace all default passwords and secrets with secure, randomly generated values before deploying to production.
+</Warning>

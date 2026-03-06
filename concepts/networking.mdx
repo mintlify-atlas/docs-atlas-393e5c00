@@ -1,0 +1,339 @@
+---
+title: Networking
+description: How Hatch implements VM networking using Linux bridge, TAP devices, DHCP, and iptables
+---
+
+## Overview
+
+Hatch sets up a full Linux networking stack on the host before Firecracker starts. Each networked VM gets its own TAP device connected to a shared bridge, a pre-allocated IP address served via DHCP, and cloud-init configuration injected directly into the rootfs.
+
+<Note>
+  All networking setup happens **on the host** before the VM boots. The guest sees a standard Ethernet interface with DHCP — no manual configuration required.
+</Note>
+
+## Network Components
+
+<CardGroup cols={3}>
+  <Card title="Bridge (fcbr0)" icon="bridge">
+    Layer 2 virtual switch shared across all VMs, gets gateway IP 172.16.0.1
+  </Card>
+  
+  <Card title="TAP Device" icon="network-wired">
+    One per VM (`fctap-<vmid>`), plugged into bridge as a port, other end held by Firecracker
+  </Card>
+  
+  <Card title="dnsmasq" icon="server">
+    DHCP server listening on bridge, serves deterministic IP allocations
+  </Card>
+</CardGroup>
+
+## Network Setup Flow
+
+When a VM is created with `enable_network: true`, the following steps occur:
+
+<Steps>
+  <Step title="Ensure bridge exists">
+    Create Linux bridge `fcbr0` (if not already present) and assign it the gateway IP from `HATCH_BRIDGE_CIDR` (default: `172.16.0.1/24`)
+    
+    ```go
+    // internal/vmm/network.go:16-81
+    func EnsureBridge(ctx context.Context, name, cidr string) error {
+      // Create bridge device
+      ip link add name fcbr0 type bridge
+      
+      // Assign gateway IP
+      ip addr add 172.16.0.1/24 dev fcbr0
+      
+      // Bring bridge up
+      ip link set fcbr0 up
+      
+      // Enable NAT for outbound traffic
+      iptables -t nat -A POSTROUTING -s 172.16.0.0/24 -j MASQUERADE
+      
+      // Allow forwarding
+      iptables -I FORWARD -s 172.16.0.0/24 -j ACCEPT
+      iptables -I FORWARD -d 172.16.0.0/24 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    }
+    ```
+  </Step>
+  
+  <Step title="Allocate IP and MAC">
+    The IP allocator picks the next free IP from the bridge subnet (starting at .2, wrapping at .254). A random MAC address is generated with locally-administered bit set.
+    
+    ```go
+    // internal/vmm/network.go:162-188
+    func (a *IPAllocator) Allocate() (net.IP, error) {
+      base := a.network.IP.To4()  // e.g., 172.16.0.0
+      
+      for i := 0; i < 250; i++ {
+        ip := net.IPv4(base[0], base[1], base[2], a.nextHost)
+        a.nextHost++  // cycles 2..254
+        
+        if !a.inUse[ip.String()] {
+          a.inUse[ip.String()] = true
+          return ip, nil
+        }
+      }
+    }
+    ```
+  </Step>
+  
+  <Step title="Create TAP device">
+    Create a TAP interface named `fctap-<first8chars-of-vmid>` and plug it into the bridge
+    
+    ```go
+    // internal/vmm/network.go:84-99
+    func CreateTap(ctx context.Context, name, bridge string) error {
+      ip tuntap add dev fctap-12345678 mode tap
+      ip link set fctap-12345678 up
+      ip link set fctap-12345678 master fcbr0
+    }
+    ```
+  </Step>
+  
+  <Step title="Register DHCP reservation">
+    Write MAC → IP mapping to dnsmasq's hosts file and signal it to reload with SIGHUP
+    
+    ```go
+    // internal/vmm/dhcp.go:131-144
+    func (d *DHCPServer) AddHost(mac, ip string) error {
+      // Append to /data/dhcp/hosts
+      data = append(data, "aa:bb:cc:dd:ee:ff,172.16.0.10\n"...)
+      
+      // Reload dnsmasq
+      d.cmd.Process.Signal(syscall.SIGHUP)
+    }
+    ```
+  </Step>
+  
+  <Step title="Inject cloud-init seed">
+    Loop-mount the VM's rootfs and write network-config to `/var/lib/cloud/seed/nocloud/`
+    
+    ```yaml
+    # network-config written by InjectCloudInitSeed
+    version: 2
+    ethernets:
+      eth0:
+        match:
+          macaddress: "aa:bb:cc:dd:ee:ff"
+        dhcp4: true
+    ```
+  </Step>
+  
+  <Step title="Setup SSH forwarding">
+    Create iptables DNAT rule to forward host port → guest:22
+    
+    ```bash
+    # Example for SSH port 16000 → 172.16.0.10:22
+    iptables -t nat -A PREROUTING -p tcp --dport 16000 -s 0.0.0.0/0 -j DNAT --to-destination 172.16.0.10:22
+    iptables -A FORWARD -d 172.16.0.10 -p tcp --dport 22 -j ACCEPT
+    ```
+  </Step>
+  
+  <Step title="Start Firecracker">
+    Pass TAP device file descriptor to Firecracker. From guest perspective, this appears as `eth0`
+  </Step>
+</Steps>
+
+## DHCP Flow
+
+The DHCP process is **deterministic** — the IP is pre-decided on the host before the VM boots:
+
+```
+┌──────────────┐      ┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+│  Guest eth0  │─────▶│ TAP fctap-xx │─────▶│ Bridge fcbr0 │─────▶│   dnsmasq    │
+└──────────────┘      └──────────────┘      └──────────────┘      └──────────────┘
+                                                                           │
+                                                      DHCPACK ◄────────────┘
+
+Guest receives:
+  IP:      172.16.0.10
+  Gateway: 172.16.0.1
+  DNS:     8.8.8.8, 8.8.4.4
+  Lease:   12 hours
+```
+
+<Accordion title="dnsmasq startup configuration">
+  ```bash
+  dnsmasq \
+    --interface=fcbr0 \
+    --bind-interfaces \
+    --except-interface=lo \
+    --dhcp-range=172.16.0.2,172.16.0.254,255.255.255.0,12h \
+    --dhcp-hostsfile=/data/dhcp/hosts \
+    --dhcp-leasefile=/data/dhcp/leases \
+    --dhcp-option=3,172.16.0.1          # default gateway
+    --dhcp-option=6,8.8.8.8,8.8.4.4     # DNS servers
+    --dhcp-authoritative \
+    --no-resolv \
+    --no-hosts \
+    --no-daemon \
+    --log-dhcp
+  ```
+  
+  On startup, Hatch truncates both the hosts file and lease file to ensure fresh state. Leases from a previous daemon run are stale (VMs are dead after restart).
+</Accordion>
+
+## NAT and Internet Access
+
+VMs reach the internet via NAT (masquerading) through the host's real NIC:
+
+```
+VM (172.16.0.10) → fcbr0 → iptables MASQUERADE → host NIC → internet
+                            (source IP rewritten to host IP)
+```
+
+The NAT rule is created when the bridge is initialized:
+
+```bash
+iptables -t nat -A POSTROUTING -s 172.16.0.0/24 -j MASQUERADE
+```
+
+<Warning>
+  If Docker is running, its default `FORWARD` policy is often `DROP`. Hatch inserts explicit `ACCEPT` rules for bridge traffic to override this.
+</Warning>
+
+## SSH Port Forwarding
+
+Each networked VM gets a dedicated host port in the range `HATCH_SSH_PORT_MIN` – `HATCH_SSH_PORT_MAX` (default: 16000–17000). This port is forwarded to the guest's SSH daemon on port 22 using iptables DNAT.
+
+### SSH Connection Path
+
+```
+ssh -p 16000 user@host
+  ─▶ host:16000
+  ─▶ iptables PREROUTING DNAT ─▶ 172.16.0.10:22
+  ─▶ fcbr0 ─▶ TAP fctap-12345678 ─▶ VM eth0 ─▶ sshd
+```
+
+### Wake-on-SSH
+
+The SSH Gateway listens on all active SSH ports. When a connection arrives:
+
+1. Look up VM by SSH port
+2. If VM is snapshotted, restore it (client sees slow handshake, ~2-5 seconds)
+3. Once running, create bidirectional TCP pipe to `guest_ip:22`
+
+See [internal/proxy/ssh_gateway.go:149-188](/workspace/source/internal/proxy/ssh_gateway.go) for implementation.
+
+## cloud-init Network Configuration
+
+Hatch uses the **NoCloud datasource** by writing seed files directly into the rootfs at `/var/lib/cloud/seed/nocloud/`. This avoids the need for a separate cidata ISO/vfat drive and works with minimal kernels that lack vfat/iso9660 support.
+
+<CodeGroup>
+```yaml network-config
+version: 2
+ethernets:
+  eth0:
+    match:
+      macaddress: "aa:bb:cc:dd:ee:ff"
+    dhcp4: true
+```
+
+```yaml meta-data
+instance-id: vm-12345678
+local-hostname: vm-12345678
+```
+
+```yaml user-data
+#cloud-config
+users:
+  - name: hatch
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAA...
+```
+</CodeGroup>
+
+These files are injected by loop-mounting the rootfs **before** Firecracker starts (see [internal/vmm/cloudinit.go:86-145](/workspace/source/internal/vmm/cloudinit.go)).
+
+## TAP Device Lifecycle
+
+<Note>
+  TAP devices persist on the host even after Firecracker exits. Hatch cleans them up explicitly on VM deletion and performs full reconciliation on startup.
+</Note>
+
+### Cleanup on VM Delete
+
+```go
+// internal/vmm/manager.go:436-438
+if vm.TapName != "" {
+  _ = DeleteTap(ctx, vm.TapName)
+}
+```
+
+### Startup Reconciliation
+
+On daemon startup, Hatch removes **all** `fctap-*` devices:
+
+```go
+// internal/vmm/manager.go:114-118
+if removed, err := ReconcileTaps(ctx, "fctap-", nil); err != nil {
+  slog.Warn("tap reconciliation failed", "error", err)
+} else if removed > 0 {
+  slog.Info("cleaned up stale tap devices", "count", removed)
+}
+```
+
+This ensures no orphaned TAP devices are left after a crash or container restart.
+
+## Network Resource Allocation
+
+### IP Allocator
+
+The `IPAllocator` maintains an in-memory map of allocated IPs and cycles through the subnet:
+
+- **Range**: `.2` to `.254` (`.1` is the gateway, `.0` and `.255` reserved)
+- **Algorithm**: Round-robin with skip-if-in-use
+- **Thread-safe**: Protected by `sync.Mutex`
+
+See [internal/vmm/network.go:146-199](/workspace/source/internal/vmm/network.go).
+
+### SSH Port Allocator
+
+The Manager maintains a map of `port → vm_id` to prevent collisions:
+
+```go
+// internal/vmm/manager.go:486-501
+func (m *Manager) allocateSSHPort(vmID string) (int, error) {
+  m.sshMu.Lock()
+  defer m.sshMu.Unlock()
+
+  for p := m.cfg.SSHPortMin; p <= m.cfg.SSHPortMax; p++ {
+    if _, used := m.sshPorts[p]; used {
+      continue
+    }
+    if portInUse(p) {  // Check actual host socket
+      continue
+    }
+    m.sshPorts[p] = vmID
+    return p, nil
+  }
+  return 0, fmt.Errorf("no available ssh ports")
+}
+```
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="VM not getting IP from DHCP">
+    - Check dnsmasq logs: `cat /data/dhcp/dnsmasq.log`
+    - Verify DHCP reservation: `cat /data/dhcp/hosts` should contain `<mac>,<ip>`
+    - Check bridge is up: `ip link show fcbr0`
+    - Verify TAP is plugged into bridge: `ip link show fctap-<vmid> | grep master`
+  </Accordion>
+  
+  <Accordion title="SSH connection refused">
+    - Check iptables DNAT rule exists: `iptables -t nat -L PREROUTING -n -v | grep <ssh_port>`
+    - Verify guest sshd is running: `ssh -p <ssh_port> user@host` and check cloud-init logs in guest
+    - Check FORWARD chain allows traffic: `iptables -L FORWARD -n -v | grep <guest_ip>`
+  </Accordion>
+  
+  <Accordion title="No internet access from VM">
+    - Check NAT rule: `iptables -t nat -L POSTROUTING -n -v | grep 172.16.0.0/24`
+    - Verify FORWARD rules are inserted (not appended): `iptables -L FORWARD -n --line-numbers`
+    - Check guest has default route: `ip route` in guest should show `default via 172.16.0.1`
+  </Accordion>
+</AccordionGroup>

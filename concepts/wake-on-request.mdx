@@ -1,0 +1,663 @@
+---
+title: Wake-on-Request
+description: How Hatch implements the serverless VM pattern with automatic idle detection and transparent wake
+---
+
+## Overview
+
+Wake-on-request is Hatch's core serverless feature: **freeze idle VMs to zero compute cost, wake them transparently on the next request**. This is achieved through three integrated components:
+
+1. **Idle monitor** — detects inactive VMs and snapshots them automatically
+2. **HTTP proxy wake** — restores snapshotted VMs when HTTP requests arrive
+3. **SSH gateway wake** — restores snapshotted VMs when SSH connections arrive
+
+<Note>
+  From the client's perspective, snapshotted VMs appear slow but never "down". HTTP requests see increased first-byte time, SSH clients see a slow handshake.
+</Note>
+
+## Idle Detection and Auto-Snapshot
+
+The idle monitor runs as a background goroutine that periodically checks all VMs with proxy routes.
+
+### Monitoring Loop
+
+```go
+// internal/proxy/idle.go:50-63
+func (m *IdleMonitor) loop() {
+  ticker := time.NewTicker(m.interval)  // Default: 30 seconds
+  defer ticker.Stop()
+  
+  for {
+    select {
+    case <-m.stopCh:
+      return
+    case <-ticker.C:
+      m.check()  // Scan all VMs
+    }
+  }
+}
+```
+
+### Idle Check Logic
+
+<Steps>
+  <Step title="Get all proxy routes">
+    Only VMs with proxy routes are candidates for idle snapshot
+    
+    ```go
+    // internal/proxy/idle.go:65-72
+    routes, err := m.db.ListAllRoutes()
+    if err != nil {
+      slog.Error("idle monitor: list routes", "error", err)
+      return
+    }
+    ```
+  </Step>
+  
+  <Step title="Check each VM state">
+    Skip VMs that aren't running
+    
+    ```go
+    // internal/proxy/idle.go:76-80
+    vm, ok := m.vmm.Get(route.VMID)
+    if !ok || vm.State != store.VMStateRunning {
+      continue
+    }
+    ```
+  </Step>
+  
+  <Step title="Calculate idle time">
+    Compare current time against last proxy access timestamp
+    
+    ```go
+    // internal/proxy/idle.go:82-91
+    lastAccess := m.proxy.LastAccessTime(route.Subdomain)
+    if lastAccess == 0 {
+      // Never accessed through proxy; use VM's created_at as baseline
+      lastAccess = vm.CreatedAt.Unix()
+    }
+    
+    idleSeconds := now - lastAccess
+    if idleSeconds < int64(m.timeout.Seconds()) {
+      continue  // Not idle yet
+    }
+    ```
+  </Step>
+  
+  <Step title="Check for active SSH sessions">
+    Read `/proc/net/nf_conntrack` to detect established SSH connections
+    
+    ```go
+    // internal/proxy/idle.go:93-97
+    if vm.SSHPort > 0 && hasActiveSSHSessions(vm.SSHPort) {
+      slog.Debug("skipping idle snapshot, active SSH session",
+        "vm", route.VMID, "ssh_port", vm.SSHPort)
+      continue
+    }
+    ```
+    
+    This prevents snapshotting a VM while someone is actively using it over SSH.
+  </Step>
+  
+  <Step title="Trigger snapshot">
+    Call VM manager to snapshot the idle VM
+    
+    ```go
+    // internal/proxy/idle.go:99-109
+    slog.Info("vm idle, triggering snapshot",
+      "vm", route.VMID,
+      "subdomain", route.Subdomain,
+      "idle_seconds", idleSeconds,
+    )
+    
+    ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+    if _, err := m.vmm.Snapshot(ctx, route.VMID); err != nil {
+      slog.Error("idle snapshot failed", "vm", route.VMID, "error", err)
+    }
+    cancel()
+    ```
+  </Step>
+</Steps>
+
+### Active SSH Detection
+
+The idle monitor checks the kernel's connection tracking table to detect active SSH sessions:
+
+```go
+// internal/proxy/idle.go:115-127
+func hasActiveSSHSessions(sshPort int) bool {
+  data, err := os.ReadFile("/proc/net/nf_conntrack")
+  if err != nil {
+    return false
+  }
+  
+  needle := fmt.Sprintf("dport=%d", sshPort)
+  for _, line := range strings.Split(string(data), "\n") {
+    if strings.Contains(line, "ESTABLISHED") && strings.Contains(line, needle) {
+      return true  // Active connection found
+    }
+  }
+  return false
+}
+```
+
+<Accordion title="Example /proc/net/nf_conntrack entry">
+  ```
+  ipv4     2 tcp      6 431999 ESTABLISHED src=10.0.0.5 dst=192.168.1.10 sport=52314 dport=16000 ...
+  ```
+  
+  This indicates an active SSH connection to host port 16000 (the VM's forwarded SSH port).
+</Accordion>
+
+## Wake-on-HTTP
+
+The proxy server handles wake-on-HTTP when a request arrives for a snapshotted VM.
+
+### Request Flow
+
+<Steps>
+  <Step title="Extract subdomain">
+    Parse Host header to get subdomain (e.g., `my-agent.hatch.local` → `my-agent`)
+    
+    ```go
+    // internal/proxy/proxy.go:52-57
+    subdomain := p.extractSubdomain(r.Host)
+    if subdomain == "" {
+      http.Error(w, `{"error":"no subdomain in host header"}`, http.StatusBadGateway)
+      return
+    }
+    ```
+  </Step>
+  
+  <Step title="Look up route">
+    Find VM ID and target port from database
+    
+    ```go
+    // internal/proxy/proxy.go:59-69
+    route, err := p.db.GetRouteBySubdomain(subdomain)
+    if err != nil {
+      http.Error(w, `{"error":"internal error"}`, http.StatusBadGateway)
+      return
+    }
+    if route == nil {
+      http.Error(w, `{"error":"no route for subdomain"}`, http.StatusBadGateway)
+      return
+    }
+    ```
+  </Step>
+  
+  <Step title="Record access time">
+    Update last-access timestamp for idle detection
+    
+    ```go
+    // internal/proxy/proxy.go:71-72
+    p.recordAccess(subdomain)
+    ```
+  </Step>
+  
+  <Step title="Check VM state">
+    Determine if wake is needed
+    
+    ```go
+    // internal/proxy/proxy.go:74-103
+    vm, ok := p.vmm.Get(route.VMID)
+    if !ok {
+      http.Error(w, `{"error":"vm not found"}`, http.StatusBadGateway)
+      return
+    }
+    
+    switch vm.State {
+    case store.VMStateRunning:
+      // Happy path: VM is already running
+      
+    case store.VMStateSnapshotted:
+      if !route.AutoWake {
+        http.Error(w, `{"error":"vm is snapshotted and auto-wake is disabled"}`,
+          http.StatusServiceUnavailable)
+        return
+      }
+      
+      // Wake the VM
+      if err := p.wakeVM(r.Context(), route.VMID); err != nil {
+        http.Error(w, `{"error":"failed to wake vm"}`, http.StatusServiceUnavailable)
+        return
+      }
+      
+      // Re-fetch VM after restore
+      vm, ok = p.vmm.Get(route.VMID)
+      
+    default:
+      http.Error(w, `{"error":"vm is in state ..., not proxying"}`,
+        http.StatusServiceUnavailable)
+      return
+    }
+    ```
+  </Step>
+  
+  <Step title="Reverse proxy">
+    Forward request to VM's guest IP and target port
+    
+    ```go
+    // internal/proxy/proxy.go:110-124
+    target := &url.URL{
+      Scheme: "http",
+      Host:   net.JoinHostPort(vm.GuestIP, fmt.Sprintf("%d", route.TargetPort)),
+    }
+    
+    rp := &httputil.ReverseProxy{
+      Director: func(req *http.Request) {
+        req.URL.Scheme = target.Scheme
+        req.URL.Host = target.Host
+        req.Host = r.Host  // Preserve original Host header
+      },
+    }
+    
+    rp.ServeHTTP(w, r)
+    ```
+  </Step>
+</Steps>
+
+### Wake VM Implementation
+
+The `wakeVM` function serializes concurrent wake requests for the same VM:
+
+```go
+// internal/proxy/proxy.go:128-160
+func (p *Proxy) wakeVM(ctx context.Context, vmID string) error {
+  // Get or create a per-VM mutex
+  val, _ := p.wakeMu.LoadOrStore(vmID, &sync.Mutex{})
+  mu := val.(*sync.Mutex)
+  mu.Lock()
+  defer mu.Unlock()
+  
+  // Re-check state under the lock: another request may have already restored it
+  vm, ok := p.vmm.Get(vmID)
+  if !ok {
+    return fmt.Errorf("vm not found: %s", vmID)
+  }
+  if vm.State == store.VMStateRunning {
+    return nil  // Already restored by a concurrent request
+  }
+  
+  ctx, cancel := context.WithTimeout(ctx, p.wakeTimeout)  // Default: 2 minutes
+  defer cancel()
+  
+  slog.Info("waking snapshotted vm", "vm", vmID)
+  _, err := p.vmm.Restore(ctx, vmID)
+  if err != nil {
+    // Mark VM as error so subsequent queued requests don't retry
+    // the same failing restore in a tight loop
+    p.vmm.MarkError(vmID, err)
+    return fmt.Errorf("restore vm %s: %w", vmID, err)
+  }
+  
+  // Allow a brief moment for the restored VM's network to come up
+  time.Sleep(500 * time.Millisecond)
+  return nil
+}
+```
+
+<Note>
+  The per-VM mutex ensures that if 10 requests arrive simultaneously for a snapshotted VM, only **one** restore operation runs. The other 9 requests wait on the mutex and return immediately when they acquire it (VM is already running).
+</Note>
+
+## Wake-on-SSH
+
+The SSH gateway listens on all active SSH ports and can wake VMs before forwarding connections.
+
+### Reconciliation Loop
+
+The gateway periodically syncs its listener set with the database:
+
+```go
+// internal/proxy/ssh_gateway.go:76-130
+func (g *SSHGateway) reconcile() {
+  vms, err := g.db.ListVMs()
+  if err != nil {
+    return
+  }
+  
+  // Build desired listener set
+  want := make(map[int]struct{})
+  for i := range vms {
+    if p := vms[i].SSHPort; p > 0 {
+      want[p] = struct{}{}
+    }
+  }
+  
+  // Add missing listeners
+  for p := range want {
+    if _, ok := current[p]; ok {
+      continue  // Already listening
+    }
+    
+    ln, err := net.Listen("tcp", net.JoinHostPort("0.0.0.0", strconv.Itoa(p)))
+    if err != nil {
+      slog.Warn("ssh gateway: listen failed", "port", p, "error", err)
+      continue
+    }
+    
+    g.listeners[p] = ln
+    slog.Info("ssh gateway: listening", "port", p)
+    go g.servePort(p, ln)
+  }
+  
+  // Remove stale listeners
+  for p, ln := range current {
+    if _, ok := want[p]; ok {
+      continue
+    }
+    ln.Close()
+    delete(g.listeners, p)
+  }
+}
+```
+
+### Connection Handling
+
+<Steps>
+  <Step title="Accept connection">
+    ```go
+    // internal/proxy/ssh_gateway.go:132-147
+    func (g *SSHGateway) servePort(port int, ln net.Listener) {
+      for {
+        conn, err := ln.Accept()
+        if err != nil {
+          return  // Listener closed
+        }
+        go g.handleConn(port, conn)
+      }
+    }
+    ```
+  </Step>
+  
+  <Step title="Look up VM by SSH port">
+    ```go
+    // internal/proxy/ssh_gateway.go:149-156
+    func (g *SSHGateway) handleConn(port int, conn net.Conn) {
+      defer conn.Close()
+      
+      vm, err := g.db.GetVMBySSHPort(port)
+      if err != nil || vm == nil {
+        return
+      }
+    ```
+  </Step>
+  
+  <Step title="Wake if snapshotted">
+    ```go
+    // internal/proxy/ssh_gateway.go:158-174
+    switch vm.State {
+    case store.VMStateRunning:
+      // Ready to proxy
+      
+    case store.VMStateSnapshotted:
+      if err := g.wakeVM(context.Background(), vm.ID); err != nil {
+        slog.Error("ssh gateway: wake vm failed", "vm", vm.ID, "error", err)
+        return
+      }
+      
+      vm, err = g.db.GetVM(vm.ID)
+      if err != nil || vm == nil || vm.State != store.VMStateRunning {
+        return
+      }
+      
+    default:
+      return  // VM in error/stopped state
+    }
+    ```
+  </Step>
+  
+  <Step title="Dial guest SSH daemon">
+    ```go
+    // internal/proxy/ssh_gateway.go:176-185
+    upstream, err := net.DialTimeout("tcp",
+      net.JoinHostPort(vm.GuestIP, "22"), 10*time.Second)
+    if err != nil {
+      slog.Debug("ssh gateway: dial guest failed", "error", err)
+      return
+    }
+    defer upstream.Close()
+    ```
+  </Step>
+  
+  <Step title="Bidirectional TCP pipe">
+    ```go
+    // internal/proxy/ssh_gateway.go:187
+    pipeBidirectional(conn, upstream)
+    ```
+    
+    This creates two goroutines to copy data in both directions:
+    ```go
+    // internal/proxy/ssh_gateway.go:230-251
+    func pipeBidirectional(a, b net.Conn) {
+      var wg sync.WaitGroup
+      wg.Add(2)
+      
+      go func() {
+        defer wg.Done()
+        io.Copy(a, b)
+        if tc, ok := a.(*net.TCPConn); ok {
+          tc.CloseWrite()
+        }
+      }()
+      
+      go func() {
+        defer wg.Done()
+        io.Copy(b, a)
+        if tc, ok := b.(*net.TCPConn); ok {
+          tc.CloseWrite()
+        }
+      }()
+      
+      wg.Wait()
+    }
+    ```
+  </Step>
+</Steps>
+
+## Concurrent Wake Request Handling
+
+Both the proxy and SSH gateway use **per-VM mutexes** to serialize wake operations:
+
+```go
+// Shared pattern in both proxy.go and ssh_gateway.go
+type Proxy struct {
+  wakeMu sync.Map  // map[vmID string]*sync.Mutex
+  // ...
+}
+
+func (p *Proxy) wakeVM(ctx context.Context, vmID string) error {
+  // Get or create mutex for this VM
+  val, _ := p.wakeMu.LoadOrStore(vmID, &sync.Mutex{})
+  mu := val.(*sync.Mutex)
+  
+  mu.Lock()
+  defer mu.Unlock()
+  
+  // Double-check: another goroutine may have already restored
+  vm, _ := p.vmm.Get(vmID)
+  if vm.State == store.VMStateRunning {
+    return nil  // Already awake
+  }
+  
+  // Perform restore (only one goroutine gets here)
+  p.vmm.Restore(ctx, vmID)
+}
+```
+
+### Example Timeline
+
+<Steps>
+  <Step title="T+0ms: 5 requests arrive">
+    All for the same snapshotted VM `vm-abc123`
+  </Step>
+  
+  <Step title="T+1ms: First request acquires mutex">
+    - Request 1: Acquires mutex, checks state (snapshotted), starts restore
+    - Requests 2-5: Block on mutex
+  </Step>
+  
+  <Step title="T+5000ms: Restore completes">
+    - Request 1: Restore finishes, VM state → running, releases mutex
+    - Request 2: Acquires mutex, checks state (running), skips restore, releases mutex
+    - Request 3: Acquires mutex, checks state (running), skips restore, releases mutex
+    - ...
+  </Step>
+  
+  <Step title="T+5005ms: All requests proceed">
+    All 5 requests now proxy to the running VM
+  </Step>
+</Steps>
+
+<Note>
+  This pattern prevents "thundering herd" restore attempts and ensures exactly-once semantics for wake operations.
+</Note>
+
+## Configuration
+
+Wake-on-request behavior is controlled by environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HATCH_IDLE_CHECK_INTERVAL` | `30s` | How often the idle monitor checks VMs |
+| `HATCH_IDLE_TIMEOUT` | `5m` | Idle duration before auto-snapshot |
+| `HATCH_WAKE_TIMEOUT` | `2m` | Max time to wait for restore to complete |
+
+### Per-Route Auto-Wake Flag
+
+Each proxy route has an `auto_wake` boolean:
+
+```bash
+POST /vms/{id}/routes
+{
+  "subdomain": "my-agent",
+  "target_port": 3000,
+  "auto_wake": true    # Enable wake-on-HTTP for this route
+}
+```
+
+If `auto_wake: false`, the proxy returns `503 Service Unavailable` when the VM is snapshotted instead of waking it.
+
+## Client Experience
+
+### HTTP Request to Snapshotted VM
+
+```bash
+$ time curl https://my-agent.hatch.local
+{"status": "ok"}
+
+real    0m6.234s    # ~6 seconds (restore time + request time)
+user    0m0.008s
+sys     0m0.004s
+```
+
+Subsequent requests:
+
+```bash
+$ time curl https://my-agent.hatch.local
+{"status": "ok"}
+
+real    0m0.234s    # Normal latency
+user    0m0.008s
+sys     0m0.004s
+```
+
+### SSH Connection to Snapshotted VM
+
+```bash
+$ time ssh -p 16000 hatch@host
+# Hangs for ~5 seconds while VM wakes
+Welcome to Ubuntu 22.04.3 LTS
+...
+
+hatch@vm-123:~$ 
+```
+
+The SSH client sees this as a slow handshake but the connection succeeds normally.
+
+## Performance Tuning
+
+<CardGroup cols={2}>
+  <Card title="Reduce Idle Timeout" icon="gauge">
+    Lower `HATCH_IDLE_TIMEOUT` to snapshot VMs more aggressively:
+    ```bash
+    HATCH_IDLE_TIMEOUT=1m  # Snapshot after 1 minute idle
+    ```
+    
+    **Trade-off**: More frequent snapshots = more S3 operations
+  </Card>
+  
+  <Card title="Increase Check Interval" icon="clock">
+    Raise `HATCH_IDLE_CHECK_INTERVAL` to reduce CPU overhead:
+    ```bash
+    HATCH_IDLE_CHECK_INTERVAL=2m  # Check every 2 minutes
+    ```
+    
+    **Trade-off**: Longer delay before idle VMs are snapshotted
+  </Card>
+  
+  <Card title="Optimize S3 Latency" icon="rocket">
+    Use MinIO on the same host for development:
+    ```bash
+    HATCH_S3_ENDPOINT=http://localhost:9000
+    ```
+    
+    Or choose an S3 region close to your Hatch host
+  </Card>
+  
+  <Card title="Pre-Warm VMs" icon="fire">
+    For latency-sensitive workloads, keep VMs running:
+    ```bash
+    # Disable auto-wake for critical routes
+    {"auto_wake": false}
+    
+    # Or set very long idle timeout
+    HATCH_IDLE_TIMEOUT=24h
+    ```
+  </Card>
+</CardGroup>
+
+## Monitoring
+
+Logs include structured events for wake operations:
+
+```json
+{"level":"info","msg":"vm idle, triggering snapshot","vm":"vm-abc123","subdomain":"my-agent","idle_seconds":320}
+{"level":"info","msg":"snapshot created","vm":"vm-abc123","snapshot":"snap-xyz789"}
+{"level":"info","msg":"waking snapshotted vm","vm":"vm-abc123"}
+{"level":"info","msg":"vm restored","vm":"vm-abc123"}
+```
+
+Watch these logs to understand idle/wake patterns and tune timeouts.
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="VM never gets snapshotted despite being idle">
+    - Check VM has a proxy route: `GET /vms/{id}/routes`
+    - Verify idle monitor is running: look for "idle monitor started" in logs
+    - Check for active SSH sessions: `cat /proc/net/nf_conntrack | grep ESTABLISHED`
+    - Ensure S3 is configured: idle snapshot requires S3 storage
+  </Accordion>
+  
+  <Accordion title="Wake fails with 'restore vm' error">
+    - Check S3 connectivity: `aws s3 ls s3://{bucket}/snapshots/{vm_id}/`
+    - Verify latest snapshot exists in database: `GET /vms/{id}/snapshots`
+    - Check disk space on host: restore needs space for memory + disk delta
+    - Review VM logs: snapshot may have corrupted state
+  </Accordion>
+  
+  <Accordion title="Concurrent requests all trigger separate restores">
+    - This indicates a bug in the per-VM mutex logic
+    - Check logs for "waking snapshotted vm" — should only appear once per wake
+    - Verify VM state is correctly updated to `running` after restore
+  </Accordion>
+  
+  <Accordion title="SSH gateway not waking VMs">
+    - Verify SSH gateway is running: "ssh wake gateway started" in logs
+    - Check gateway is listening on VM's SSH port: `netstat -tlnp | grep {ssh_port}`
+    - Ensure VM has `ssh_port` set in database
+    - Test restore manually: `POST /vms/{id}/restore`
+  </Accordion>
+</AccordionGroup>

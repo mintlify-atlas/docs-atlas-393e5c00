@@ -1,0 +1,451 @@
+---
+title: Idle VM Management
+description: Automatically snapshot inactive VMs to save compute resources and costs
+---
+
+Hatch includes an idle monitor that automatically snapshots VMs with no recent activity. This enables serverless-style cost savings while maintaining the ability to instantly restore VMs via [auto-wake](/guides/reverse-proxy#auto-wake-configuration).
+
+## How Idle Detection Works
+
+The idle monitor runs a periodic check loop:
+
+<Steps>
+  <Step title="Monitor wakes up">
+    Every `HATCH_IDLE_CHECK_INTERVAL` (default: 5 minutes), the monitor checks all running VMs.
+  </Step>
+
+  <Step title="Identify VMs with proxy routes">
+    Only VMs that have at least one proxy route are evaluated. VMs without routes are ignored.
+  </Step>
+
+  <Step title="Calculate idle time">
+    For each VM, the monitor checks:
+    - **Last proxy request time**: Tracked by the reverse proxy for each subdomain
+    - **VM creation time**: Used as baseline if no proxy requests have been made
+    - **SSH connection status**: Checks kernel conntrack for active SSH sessions
+  </Step>
+
+  <Step title="Compare against timeout">
+    If idle time exceeds `HATCH_IDLE_TIMEOUT` (default: 30 minutes) and no active SSH sessions exist, the VM is snapshotted.
+  </Step>
+
+  <Step title="Snapshot the VM">
+    The monitor calls `POST /vms/{id}/snapshot`, which pauses the VM, uploads state to S3, and transitions to `snapshotted` state.
+  </Step>
+</Steps>
+
+<Note>
+  The idle monitor only affects VMs in `running` state. Stopped, snapshotted, or errored VMs are ignored.
+</Note>
+
+## Configuring Idle Timeout
+
+Control idle detection behavior with environment variables:
+
+```bash
+# How often to check for idle VMs (default: 5m)
+export HATCH_IDLE_CHECK_INTERVAL=10m
+
+# How long a VM must be idle before snapshotting (default: 30m)
+export HATCH_IDLE_TIMEOUT=1h
+```
+
+<CodeGroup>
+```bash Development (aggressive)
+# Snapshot after 10 minutes of inactivity
+export HATCH_IDLE_TIMEOUT=10m
+export HATCH_IDLE_CHECK_INTERVAL=2m
+```
+
+```bash Production (conservative)
+# Snapshot after 2 hours of inactivity
+export HATCH_IDLE_TIMEOUT=2h
+export HATCH_IDLE_CHECK_INTERVAL=15m
+```
+
+```bash Disabled
+# Set timeout to a very large value
+export HATCH_IDLE_TIMEOUT=8760h  # 1 year
+```
+</CodeGroup>
+
+<Warning>
+  Changing these values requires a Hatch restart. The idle monitor reads configuration only on startup.
+</Warning>
+
+## Idle Time Calculation
+
+The idle monitor uses this logic to determine idle time:
+
+```
+if proxy_last_access_time > 0:
+  idle_seconds = now - proxy_last_access_time
+else:
+  idle_seconds = now - vm.created_at
+
+if idle_seconds >= idle_timeout:
+  if not has_active_ssh_sessions:
+    snapshot_vm()
+```
+
+**Key points:**
+- VMs are considered active if they've received HTTP requests via the proxy
+- VMs without any proxy requests are considered idle since creation
+- Active SSH sessions prevent snapshotting (see below)
+
+## SSH Session Detection
+
+Before snapshotting a VM, the idle monitor checks for active SSH connections:
+
+<Steps>
+  <Step title="Query netfilter conntrack">
+    The monitor reads `/proc/net/nf_conntrack` to find established TCP connections.
+  </Step>
+
+  <Step title="Filter by SSH port">
+    It searches for connections to the VM's SSH forwarding port (e.g., `dport=2200`).
+  </Step>
+
+  <Step title="Check connection state">
+    Only connections in `ESTABLISHED` state are counted as active sessions.
+  </Step>
+
+  <Step title="Skip snapshot if active">
+    If any active SSH session is found, the VM is **not** snapshotted, even if idle time exceeds the threshold.
+  </Step>
+</Steps>
+
+**Example log output:**
+```
+skipping idle snapshot, active SSH session vm=vm-abc123 ssh_port=2200
+```
+
+<Tip>
+  SSH detection prevents snapshotting VMs while you're actively working on them, even if there's no HTTP traffic.
+</Tip>
+
+## Auto-Snapshot Behavior
+
+When the idle monitor triggers a snapshot:
+
+<Steps>
+  <Step title="VM is paused">
+    Firecracker pauses the VM, freezing CPU and memory state.
+  </Step>
+
+  <Step title="Snapshot uploaded to S3">
+    State, memory, and disk files are uploaded to S3 storage.
+  </Step>
+
+  <Step title="VM transitions to snapshotted">
+    The VM state changes to `snapshotted`, and the Firecracker process is terminated.
+  </Step>
+
+  <Step title="Resources are cleaned up">
+    TAP device, SSH forwarding rules, and DHCP reservation are removed. IP allocation is retained for restore.
+  </Step>
+</Steps>
+
+**Idle snapshot log:**
+```
+vm idle, triggering snapshot vm=vm-abc123 subdomain=my-app idle_seconds=1805
+```
+
+If the snapshot fails, the VM is marked as `error` and remains running:
+```
+idle snapshot failed vm=vm-abc123 error="s3 upload failed: access denied"
+```
+
+## VMs Without Proxy Routes
+
+VMs that **do not** have any proxy routes are **never snapshotted** by the idle monitor, regardless of activity level.
+
+**Rationale:**
+- VMs without routes are not exposed via HTTP, so proxy traffic is not a meaningful activity indicator
+- Such VMs may be used for batch processing, databases, or SSH-only access
+- Users must manually snapshot these VMs if desired
+
+<Note>
+  To enable idle management for a VM, create at least one proxy route, even if you don't plan to use it for HTTP traffic.
+</Note>
+
+## Monitoring Idle VMs
+
+You can identify VMs that are idle by querying the API:
+
+<Steps>
+  <Step title="List all VMs">
+    ```bash
+    curl https://api.hatch.example.com/vms \
+      -H "Authorization: Bearer YOUR_API_KEY"
+    ```
+  </Step>
+
+  <Step title="Check VM state">
+    VMs in `snapshotted` state were idle-snapshotted:
+
+    ```json
+    [
+      {
+        "id": "vm-abc123",
+        "state": "snapshotted",
+        "updated_at": "2026-03-06T14:30:00Z"
+      }
+    ]
+    ```
+  </Step>
+
+  <Step title="List snapshots">
+    Check snapshot creation times to see when idle snapshots occurred:
+
+    ```bash
+    curl https://api.hatch.example.com/vms/vm-abc123/snapshots \
+      -H "Authorization: Bearer YOUR_API_KEY"
+    ```
+  </Step>
+</Steps>
+
+## Wake-on-Request
+
+When an idle-snapshotted VM receives an HTTP request via a proxy route with `auto_wake: true`, it automatically restores:
+
+```
+1. HTTP request → my-app.hatch.example.com
+2. Proxy detects VM is snapshotted
+3. Proxy calls restore API
+4. VM loads from S3 and resumes
+5. Request is forwarded to VM
+```
+
+See the [Reverse Proxy guide](/guides/reverse-proxy#auto-wake-configuration) for details.
+
+<Tip>
+  **Idle + auto-wake = serverless microVMs!** VMs are paused when not in use and wake instantly on demand, minimizing costs.
+</Tip>
+
+## Disabling Idle Management
+
+To prevent a specific VM from being idle-snapshotted:
+
+### Option 1: Don't create proxy routes
+
+VMs without proxy routes are never evaluated by the idle monitor.
+
+### Option 2: Set a very long idle timeout
+
+```bash
+export HATCH_IDLE_TIMEOUT=8760h  # 1 year
+```
+
+This effectively disables idle snapshots for all VMs.
+
+### Option 3: Keep VMs active
+
+Make periodic requests to the VM's proxy route:
+
+```bash
+# Cron job to keep VM active
+*/10 * * * * curl -s https://my-app.hatch.example.com/health > /dev/null
+```
+
+This resets the idle timer every 10 minutes.
+
+<Warning>
+  There is no per-VM idle configuration currently. Idle timeout applies to all VMs globally.
+</Warning>
+
+## Best Practices
+
+<Steps>
+  <Step title="Enable idle management for dev/staging">
+    Save costs by letting non-production VMs snapshot when inactive:
+
+    ```bash
+    export HATCH_IDLE_TIMEOUT=30m
+    export HATCH_IDLE_CHECK_INTERVAL=5m
+    ```
+  </Step>
+
+  <Step title="Disable for production VMs">
+    Keep production services always running:
+
+    ```bash
+    export HATCH_IDLE_TIMEOUT=8760h  # Effectively disabled
+    ```
+
+    Or don't create proxy routes for production VMs.
+  </Step>
+
+  <Step title="Use auto-wake with idle management">
+    Enable auto-wake on proxy routes so snapshotted VMs wake on demand:
+
+    ```bash
+    curl -X POST https://api.hatch.example.com/vms/vm-abc123/routes \
+      -H "Authorization: Bearer YOUR_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "subdomain": "staging-app",
+        "target_port": 8080,
+        "auto_wake": true
+      }'
+    ```
+  </Step>
+
+  <Step title="Monitor S3 snapshot storage">
+    Idle snapshots consume S3 storage. Periodically review and clean up old snapshots.
+  </Step>
+
+  <Step title="Test idle behavior in staging">
+    Verify idle snapshots and auto-wake work correctly before enabling in production:
+
+    ```bash
+    # Set aggressive timeout for testing
+    export HATCH_IDLE_TIMEOUT=5m
+    export HATCH_IDLE_CHECK_INTERVAL=1m
+
+    # Wait for VM to be snapshotted
+    sleep 360
+
+    # Trigger auto-wake by making a request
+    curl https://test-app.hatch.example.com
+    ```
+  </Step>
+</Steps>
+
+## Idle Monitor Logs
+
+The idle monitor logs useful information:
+
+**Startup:**
+```
+idle monitor started interval=5m0s timeout=30m0s
+```
+
+**Idle snapshot triggered:**
+```
+vm idle, triggering snapshot vm=vm-abc123 subdomain=my-app idle_seconds=1805
+```
+
+**SSH session prevented snapshot:**
+```
+skipping idle snapshot, active SSH session vm=vm-abc123 ssh_port=2200
+```
+
+**Snapshot failed:**
+```
+idle snapshot failed vm=vm-abc123 error="snapshot storage not configured"
+```
+
+**Monitor stopped:**
+```
+idle monitor stopped
+```
+
+<Tip>
+  Enable debug logging to see idle checks for all VMs:
+
+  ```bash
+  export HATCH_LOG_LEVEL=debug
+  ```
+</Tip>
+
+## Troubleshooting
+
+### VM not being snapshotted
+
+**Possible causes:**
+1. VM has no proxy routes
+2. VM has active SSH session
+3. Idle time hasn't exceeded timeout
+4. Idle monitor is not running
+
+**Solutions:**
+```bash
+# Check if VM has routes
+curl https://api.hatch.example.com/vms/vm-abc123/routes \
+  -H "Authorization: Bearer YOUR_API_KEY"
+
+# Check for SSH connections (on host)
+sudo cat /proc/net/nf_conntrack | grep "dport=2200" | grep ESTABLISHED
+
+# Verify idle timeout configuration
+echo $HATCH_IDLE_TIMEOUT
+```
+
+### VM snapshotted too aggressively
+
+**Possible causes:**
+1. Idle timeout is too short
+2. Health check endpoint not being polled
+3. SSH detection not working (container networking issues)
+
+**Solutions:**
+```bash
+# Increase idle timeout
+export HATCH_IDLE_TIMEOUT=2h
+
+# Add health check polling
+*/5 * * * * curl -s https://my-app.hatch.example.com/health > /dev/null
+```
+
+### Idle snapshots failing
+
+**Error:** `snapshot storage not configured`
+
+**Solution:** Configure S3 storage:
+```bash
+export HATCH_S3_ENDPOINT=https://s3.amazonaws.com
+export HATCH_S3_REGION=us-west-2
+export HATCH_S3_BUCKET=snapshots
+export HATCH_S3_ACCESS_KEY=...
+export HATCH_S3_SECRET_KEY=...
+```
+
+## Advanced: SSH Detection Internals
+
+The idle monitor detects SSH sessions by parsing `/proc/net/nf_conntrack`:
+
+**Sample conntrack entry:**
+```
+ipv4 tcp 6 431997 ESTABLISHED src=203.0.113.10 dst=203.0.113.20 sport=52341 dport=2200 src=192.168.241.10 dst=203.0.113.10 sport=22 dport=52341
+```
+
+**Detection logic:**
+1. Filter lines containing `ESTABLISHED`
+2. Filter lines containing `dport={ssh_port}` (e.g., `dport=2200`)
+3. If any matches found, SSH session is active
+
+<Note>
+  This detection method requires the host kernel to have `nf_conntrack` enabled (standard on most Linux distributions).
+</Note>
+
+## Configuration Reference
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HATCH_IDLE_CHECK_INTERVAL` | `5m` | How often to check for idle VMs |
+| `HATCH_IDLE_TIMEOUT` | `30m` | Idle duration before snapshotting |
+| `HATCH_PROXY_WAKE_TIMEOUT` | `30s` | Max time to wait for restore during auto-wake |
+
+All duration values support Go duration syntax:
+- `30s` = 30 seconds
+- `5m` = 5 minutes
+- `2h` = 2 hours
+- `24h` = 24 hours
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Reverse Proxy" icon="route" href="/guides/reverse-proxy">
+    Configure auto-wake for snapshotted VMs
+  </Card>
+  <Card title="Snapshots" icon="camera" href="/guides/snapshot-restore">
+    Understand snapshot creation and restoration
+  </Card>
+  <Card title="Creating VMs" icon="plus" href="/guides/creating-vms">
+    Learn about VM lifecycle and states
+  </Card>
+  <Card title="Network Setup" icon="network-wired" href="/guides/networking-setup">
+    Configure SSH access and port forwarding
+  </Card>
+</CardGroup>

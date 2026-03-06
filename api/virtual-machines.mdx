@@ -1,0 +1,308 @@
+---
+title: 'Virtual Machines'
+description: 'Manage Firecracker microVMs'
+---
+
+## Create VM
+
+<api method="POST" path="/vms" />
+
+Create and start a new Firecracker microVM.
+
+### Request Body
+
+<ParamField body="image_id" type="string">
+  The ID of the image to use. If not provided, uses the default image configured via `HATCH_DEFAULT_KERNEL_PATH` and `HATCH_DEFAULT_ROOTFS_PATH`.
+</ParamField>
+
+<ParamField body="template_id" type="string">
+  Optional template ID to use for default values. Template values are overridden by explicit request parameters.
+</ParamField>
+
+<ParamField body="vcpu_count" type="integer">
+  Number of virtual CPUs. Defaults to `HATCH_DEFAULT_VCPU` (default: 1).
+</ParamField>
+
+<ParamField body="mem_mib" type="integer">
+  Memory size in MiB. Defaults to `HATCH_DEFAULT_MEM_MIB` (default: 512).
+</ParamField>
+
+<ParamField body="boot_args" type="string">
+  Kernel boot arguments. Defaults to the configured default boot args.
+</ParamField>
+
+<ParamField body="enable_network" type="boolean">
+  Whether to enable networking. Defaults to `true`.
+</ParamField>
+
+<ParamField body="guest_ip" type="string">
+  Specific guest IP address to assign. If not provided, an IP is automatically allocated from the bridge CIDR.
+</ParamField>
+
+<ParamField body="guest_mac" type="string">
+  Specific guest MAC address. If not provided, a MAC is automatically generated.
+</ParamField>
+
+<ParamField body="user_data" type="string">
+  Cloud-init user data to configure the VM on first boot.
+</ParamField>
+
+### Response
+
+<ResponseField name="id" type="string">
+  Unique VM identifier (e.g., `vm_abc123`).
+</ResponseField>
+
+<ResponseField name="image_id" type="string">
+  The image ID used for this VM.
+</ResponseField>
+
+<ResponseField name="template_id" type="string">
+  The template ID used (if any).
+</ResponseField>
+
+<ResponseField name="state" type="string">
+  Current VM state. One of: `starting`, `running`, `stopping`, `stopped`, `snapshotted`, `error`.
+</ResponseField>
+
+<ResponseField name="vcpu_count" type="integer">
+  Number of virtual CPUs.
+</ResponseField>
+
+<ResponseField name="mem_mib" type="integer">
+  Memory size in MiB.
+</ResponseField>
+
+<ResponseField name="guest_ip" type="string">
+  The guest IP address assigned to the VM.
+</ResponseField>
+
+<ResponseField name="guest_mac" type="string">
+  The guest MAC address.
+</ResponseField>
+
+<ResponseField name="tap_name" type="string">
+  The TAP network interface name.
+</ResponseField>
+
+<ResponseField name="ssh_port" type="integer">
+  The host port forwarded to the VM's SSH port (22).
+</ResponseField>
+
+<ResponseField name="user_data" type="string">
+  The cloud-init user data.
+</ResponseField>
+
+<ResponseField name="enable_network" type="boolean">
+  Whether networking is enabled.
+</ResponseField>
+
+<ResponseField name="created_at" type="string">
+  ISO 8601 timestamp when the VM was created.
+</ResponseField>
+
+<ResponseField name="updated_at" type="string">
+  ISO 8601 timestamp when the VM was last updated.
+</ResponseField>
+
+### Example Request
+
+```bash
+curl -X POST http://localhost:8080/vms \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vcpu_count": 2,
+    "mem_mib": 1024,
+    "enable_network": true,
+    "user_data": "#!/bin/bash\necho 'Hello from Hatch'"
+  }'
+```
+
+### Example Response
+
+```json
+{
+  "id": "vm_abc123def456",
+  "image_id": "img_default",
+  "state": "running",
+  "vcpu_count": 2,
+  "mem_mib": 1024,
+  "guest_ip": "172.16.0.10",
+  "guest_mac": "02:FC:00:00:00:0A",
+  "tap_name": "tap0",
+  "ssh_port": 16001,
+  "user_data": "#!/bin/bash\necho 'Hello from Hatch'",
+  "enable_network": true,
+  "created_at": "2026-03-06T12:00:00Z",
+  "updated_at": "2026-03-06T12:00:00Z"
+}
+```
+
+---
+
+## List VMs
+
+<api method="GET" path="/vms" />
+
+Retrieve a list of all VMs.
+
+### Response
+
+Returns an array of VM objects. See the VM response schema above for field descriptions.
+
+### Example Request
+
+```bash
+curl http://localhost:8080/vms \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+### Example Response
+
+```json
+[
+  {
+    "id": "vm_abc123def456",
+    "image_id": "img_default",
+    "state": "running",
+    "vcpu_count": 2,
+    "mem_mib": 1024,
+    "guest_ip": "172.16.0.10",
+    "ssh_port": 16001,
+    "enable_network": true,
+    "created_at": "2026-03-06T12:00:00Z",
+    "updated_at": "2026-03-06T12:00:00Z"
+  },
+  {
+    "id": "vm_xyz789ghi012",
+    "image_id": "img_default",
+    "state": "stopped",
+    "vcpu_count": 1,
+    "mem_mib": 512,
+    "enable_network": false,
+    "created_at": "2026-03-06T11:30:00Z",
+    "updated_at": "2026-03-06T11:45:00Z"
+  }
+]
+```
+
+---
+
+## Get VM
+
+<api method="GET" path="/vms/{id}" />
+
+Retrieve details of a specific VM.
+
+### Path Parameters
+
+<ParamField path="id" type="string" required>
+  The VM ID.
+</ParamField>
+
+### Response
+
+Returns a VM object. See the VM response schema in the Create VM section.
+
+### Example Request
+
+```bash
+curl http://localhost:8080/vms/vm_abc123def456 \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+### Example Response
+
+```json
+{
+  "id": "vm_abc123def456",
+  "image_id": "img_default",
+  "state": "running",
+  "vcpu_count": 2,
+  "mem_mib": 1024,
+  "guest_ip": "172.16.0.10",
+  "guest_mac": "02:FC:00:00:00:0A",
+  "tap_name": "tap0",
+  "ssh_port": 16001,
+  "enable_network": true,
+  "created_at": "2026-03-06T12:00:00Z",
+  "updated_at": "2026-03-06T12:00:00Z"
+}
+```
+
+---
+
+## Delete VM
+
+<api method="DELETE" path="/vms/{id}" />
+
+Stop and delete a VM. This removes the VM, cleans up its resources, and deletes the database record.
+
+### Path Parameters
+
+<ParamField path="id" type="string" required>
+  The VM ID.
+</ParamField>
+
+### Response
+
+<ResponseField name="status" type="string">
+  Returns `deleted` on success.
+</ResponseField>
+
+### Example Request
+
+```bash
+curl -X DELETE http://localhost:8080/vms/vm_abc123def456 \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+### Example Response
+
+```json
+{
+  "status": "deleted"
+}
+```
+
+---
+
+## Stop VM
+
+<api method="POST" path="/vms/{id}/stop" />
+
+Gracefully stop a running VM.
+
+### Path Parameters
+
+<ParamField path="id" type="string" required>
+  The VM ID.
+</ParamField>
+
+### Response
+
+Returns the updated VM object with state set to `stopped`.
+
+### Example Request
+
+```bash
+curl -X POST http://localhost:8080/vms/vm_abc123def456/stop \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+### Example Response
+
+```json
+{
+  "id": "vm_abc123def456",
+  "image_id": "img_default",
+  "state": "stopped",
+  "vcpu_count": 2,
+  "mem_mib": 1024,
+  "guest_ip": "172.16.0.10",
+  "enable_network": true,
+  "created_at": "2026-03-06T12:00:00Z",
+  "updated_at": "2026-03-06T12:15:00Z"
+}
+```

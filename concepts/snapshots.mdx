@@ -1,0 +1,471 @@
+---
+title: Snapshots
+description: How Hatch captures and restores full VM state using Firecracker snapshots and S3 storage
+---
+
+## Overview
+
+Hatch snapshots capture the **complete VM state** — CPU registers, memory contents, and disk changes — and upload them to S3-compatible storage. The VM can later be restored to exactly where it was paused, with the same IP, MAC address, and SSH port.
+
+<Note>
+  Snapshots enable the core serverless pattern: freeze idle VMs to zero compute cost, wake them transparently on the next request.
+</Note>
+
+## Snapshot Artifacts
+
+A snapshot consists of three components:
+
+<CardGroup cols={3}>
+  <Card title="vmstate" icon="microchip">
+    CPU registers, device state, Firecracker internal state (uncompressed, ~100 KB)
+  </Card>
+  
+  <Card title="memory.gz" icon="memory">
+    Full memory dump of the guest (gzip compressed, typically 10-50% of configured RAM)
+  </Card>
+  
+  <Card title="disk.delta.gz" icon="hard-drive">
+    Block-level diff between current rootfs and base image (gzip compressed, often < 100 MB)
+  </Card>
+</CardGroup>
+
+All three artifacts are uploaded to S3 under the path:
+
+```
+snapshots/{vm_id}/{snapshot_id}/
+  vmstate
+  memory.gz
+  disk.delta.gz
+```
+
+## Snapshot Creation Flow
+
+<Steps>
+  <Step title="Pre-flight checks">
+    - Verify S3 is configured
+    - Verify VM is in `running` state
+    - Look up base image for disk delta computation
+  </Step>
+  
+  <Step title="Pause the VM">
+    Call Firecracker API `PauseVM()` to freeze guest execution
+    
+    ```go
+    // internal/vmm/snapshot.go:75-77
+    if err := machine.PauseVM(ctx); err != nil {
+      return nil, fmt.Errorf("pause vm: %w", err)
+    }
+    ```
+  </Step>
+  
+  <Step title="Create Firecracker snapshot">
+    Call Firecracker API `CreateSnapshot()` to dump memory and vmstate to local files
+    
+    ```go
+    // internal/vmm/snapshot.go:79-82
+    memPath := filepath.Join(snapDir, "memory")
+    statePath := filepath.Join(snapDir, "vmstate")
+    
+    if err := machine.CreateSnapshot(ctx, memPath, statePath); err != nil {
+      return nil, fmt.Errorf("create snapshot: %w", err)
+    }
+    ```
+  </Step>
+  
+  <Step title="Compute disk delta">
+    Use `rsync --only-write-batch` to generate a binary patch from base image → current rootfs
+    
+    ```go
+    // internal/vmm/snapshot.go:84-90
+    vmRootfs := filepath.Join(vm.WorkDir, "rootfs.ext4")
+    deltaPath := filepath.Join(snapDir, "disk.delta")
+    
+    // ComputeDelta uses rsync to create a binary diff
+    if err := ComputeDelta(image.RootfsPath, vmRootfs, deltaPath); err != nil {
+      return nil, fmt.Errorf("compute disk delta: %w", err)
+    }
+    ```
+    
+    This captures **only** the blocks modified by the VM, not the entire disk.
+  </Step>
+  
+  <Step title="Upload to S3">
+    Upload artifacts with gzip compression for memory and disk delta
+    
+    ```go
+    // internal/vmm/snapshot.go:93-106
+    prefix := fmt.Sprintf("snapshots/%s/%s", vmID, snapID)
+    
+    // vmstate is small, no compression
+    m.s3.UploadFile(ctx, prefix+"/vmstate", statePath)
+    
+    // memory and disk benefit from compression
+    m.s3.UploadFileCompressed(ctx, prefix+"/memory.gz", memPath)
+    m.s3.UploadFileCompressed(ctx, prefix+"/disk.delta.gz", deltaPath)
+    ```
+  </Step>
+  
+  <Step title="Persist snapshot record">
+    Save metadata to database with VM config JSON (for restore) and artifact S3 keys
+    
+    ```go
+    // internal/vmm/snapshot.go:117-143
+    snap := &store.Snapshot{
+      ID:        snapID,
+      VMID:      vmID,
+      StateKey:  stateKey,
+      MemoryKey: memKey,
+      DiskKey:   diskKey,
+      VMConfig:  string(cfgJSON),  // CPU, mem, IP, MAC, paths
+      SizeBytes: totalSize,
+      CreatedAt: time.Now().UTC(),
+    }
+    
+    m.db.CreateSnapshot(*snap)
+    ```
+  </Step>
+  
+  <Step title="Clean up resources">
+    - Kill Firecracker process
+    - Delete TAP device
+    - Remove DHCP reservation
+    - Teardown SSH forwarding iptables rules
+    - Keep IP allocated (VM will reuse on restore)
+    - Keep work directory (contains rootfs for next restore)
+    - Mark VM state as `snapshotted`
+  </Step>
+</Steps>
+
+<Accordion title="View full snapshot code">
+  See [internal/vmm/snapshot.go:33-156](/workspace/source/internal/vmm/snapshot.go) for complete implementation.
+</Accordion>
+
+## Snapshot Record Schema
+
+The snapshot metadata stored in PostgreSQL:
+
+```sql
+CREATE TABLE snapshots (
+  id          TEXT PRIMARY KEY,
+  vm_id       TEXT NOT NULL,
+  state_key   TEXT NOT NULL,    -- S3 key for vmstate
+  memory_key  TEXT NOT NULL,    -- S3 key for memory.gz
+  disk_key    TEXT NOT NULL,    -- S3 key for disk.delta.gz
+  vm_config   TEXT NOT NULL,    -- JSON blob with restore parameters
+  size_bytes  BIGINT,           -- Uncompressed size of all artifacts
+  created_at  TIMESTAMP NOT NULL
+);
+```
+
+The `vm_config` JSON includes:
+
+```json
+{
+  "image_id": "img-abc123",
+  "vcpu_count": 2,
+  "mem_mib": 1024,
+  "guest_ip": "172.16.0.10",
+  "guest_mac": "aa:bb:cc:dd:ee:ff",
+  "tap_name": "fctap-12345678",
+  "boot_args": "console=ttyS0 reboot=k panic=1",
+  "kernel_path": "/data/kernel/vmlinux",
+  "rootfs_path": "/data/images/ubuntu-22.04.ext4"
+}
+```
+
+This allows restore to work even if the base image has been updated or moved.
+
+## Restore Process
+
+<Steps>
+  <Step title="Pre-flight checks">
+    - Verify S3 is configured
+    - Verify VM is in `snapshotted` state
+    - Look up latest snapshot from database
+    - Parse VM config JSON from snapshot record
+  </Step>
+  
+  <Step title="Prepare work directory">
+    Create fresh VM work directory and clean socket path
+    
+    ```go
+    // internal/vmm/snapshot.go:193-200
+    vmDir := filepath.Join(m.cfg.DataDir, "vms", vmID)
+    os.MkdirAll(vmDir, 0o755)
+    
+    socketPath := filepath.Join(vmDir, "firecracker.socket")
+    os.RemoveAll(socketPath)  // Clean stale socket from previous run
+    ```
+  </Step>
+  
+  <Step title="Download snapshot artifacts">
+    Download from S3 with automatic gzip decompression
+    
+    ```go
+    // internal/vmm/snapshot.go:203-216
+    memPath := filepath.Join(vmDir, "memory")
+    statePath := filepath.Join(vmDir, "vmstate")
+    deltaPath := filepath.Join(vmDir, "disk.delta")
+    
+    m.s3.DownloadCompressed(ctx, snap.MemoryKey, memPath)
+    m.s3.Download(ctx, snap.StateKey, statePath)
+    m.s3.DownloadCompressed(ctx, snap.DiskKey, deltaPath)
+    ```
+  </Step>
+  
+  <Step title="Reconstruct rootfs">
+    Apply disk delta to base image to recreate the VM's modified rootfs
+    
+    ```go
+    // internal/vmm/snapshot.go:218-223
+    diskPath := filepath.Join(vmDir, "rootfs.ext4")
+    
+    // Copy base image and apply delta using rsync --read-batch
+    if err := ApplyDelta(cfg.RootfsPath, deltaPath, diskPath); err != nil {
+      return nil, fmt.Errorf("apply disk delta: %w", err)
+    }
+    ```
+  </Step>
+  
+  <Step title="Re-establish networking">
+    Recreate TAP device, DHCP reservation, and SSH forwarding with **original** IP and MAC
+    
+    ```go
+    // internal/vmm/snapshot.go:225-240
+    tapName := fmt.Sprintf("fctap-%s", vmID[:8])
+    
+    // Delete any leftover TAP from failed restore attempt
+    DeleteTap(ctx, tapName)
+    
+    CreateTap(ctx, tapName, m.cfg.BridgeName)
+    m.dhcp.AddHost(cfg.GuestMAC, cfg.GuestIP)
+    ```
+  </Step>
+  
+  <Step title="Load snapshot into Firecracker">
+    Start new Firecracker process in snapshot mode with memory and vmstate paths
+    
+    ```go
+    // internal/vmm/snapshot.go:242-253
+    machine, err := newMachineFromSnapshot(ctx, m.cfg.FirecrackerBinary, machineConfig{
+      socketPath: socketPath,
+      kernelPath: cfg.KernelPath,
+      rootfsPath: diskPath,
+      vmID:       vmID,
+      vcpuCount:  int64(cfg.VCPUCount),
+      memMib:     int64(cfg.MemMib),
+      tapName:    tapName,
+      macAddr:    cfg.GuestMAC,
+      logDir:     vmDir,
+    }, memPath, statePath)
+    ```
+  </Step>
+  
+  <Step title="Resume execution">
+    Call `machine.Start()` which resumes the VM from the paused state
+    
+    ```go
+    // internal/vmm/snapshot.go:259-262
+    if err := machine.Start(context.Background()); err != nil {
+      // Cleanup on failure: delete TAP, release resources
+      return nil, fmt.Errorf("start restored machine: %w", err)
+    }
+    ```
+  </Step>
+  
+  <Step title="Restore SSH forwarding">
+    Re-create iptables DNAT rules for the VM's SSH port
+    
+    ```go
+    // internal/vmm/snapshot.go:264-272
+    if err := setupSSHForward(ctx, vm.SSHPort, vm.GuestIP, m.cfg.SSHAllowedCIDR); err != nil {
+      // Cleanup on failure
+      return nil, fmt.Errorf("setup ssh forward after restore: %w", err)
+    }
+    ```
+  </Step>
+  
+  <Step title="Mark as running">
+    Update database state to `running` and register machine handle
+    
+    ```go
+    // internal/vmm/snapshot.go:274-283
+    m.mu.Lock()
+    m.machines[vmID] = machine
+    m.mu.Unlock()
+    
+    m.db.UpdateVMState(vmID, store.VMStateRunning)
+    ```
+  </Step>
+</Steps>
+
+<Accordion title="View full restore code">
+  See [internal/vmm/snapshot.go:161-284](/workspace/source/internal/vmm/snapshot.go) for complete implementation.
+</Accordion>
+
+## Disk Delta Algorithm
+
+Hatch uses `rsync` to compute and apply disk deltas:
+
+### Creating Delta (Snapshot)
+
+```bash
+# internal/vmm/diskdiff.go
+rsync --only-write-batch=/path/to/disk.delta \
+      --checksum \
+      /data/images/base.ext4 \
+      /data/vms/vm-123/rootfs.ext4
+```
+
+This generates a binary batch file containing **only the modified blocks**.
+
+### Applying Delta (Restore)
+
+```bash
+# Copy base image
+cp --reflink=auto /data/images/base.ext4 /data/vms/vm-123/rootfs.ext4
+
+# Apply delta
+rsync --read-batch=/path/to/disk.delta /data/vms/vm-123/rootfs.ext4
+```
+
+<Note>
+  Using `--reflink=auto` with copy-on-write filesystems (btrfs, XFS with reflink) makes the initial copy instant and saves disk space.
+</Note>
+
+## Snapshot Compression
+
+Hatch compresses memory dumps and disk deltas using gzip before uploading to S3:
+
+```go
+// internal/store/s3.go
+func (c *S3Client) UploadFileCompressed(ctx context.Context, key, localPath string) error {
+  file, _ := os.Open(localPath)
+  defer file.Close()
+  
+  pr, pw := io.Pipe()
+  gzWriter := gzip.NewWriter(pw)
+  
+  // Stream: file → gzip → S3
+  go func() {
+    io.Copy(gzWriter, file)
+    gzWriter.Close()
+    pw.Close()
+  }()
+  
+  c.client.PutObject(ctx, &s3.PutObjectInput{
+    Bucket: c.bucket,
+    Key:    key,
+    Body:   pr,
+  })
+}
+```
+
+Typical compression ratios:
+- **Memory**: 40-60% reduction (depends on guest workload)
+- **Disk delta**: 70-90% reduction (text files, executables compress well)
+
+## Resource Lifecycle
+
+### What gets cleaned up on snapshot?
+
+✅ **Destroyed**:
+- Firecracker process (killed)
+- TAP device (deleted)
+- DHCP reservation (removed from dnsmasq)
+- SSH forwarding rules (iptables rules deleted)
+- Machine handle (removed from in-memory map)
+
+❌ **Preserved**:
+- IP allocation (kept reserved for restore)
+- SSH port allocation (kept reserved)
+- Work directory (contains rootfs for next restore)
+- Database record (state changed to `snapshotted`)
+
+### What gets recreated on restore?
+
+- Fresh Firecracker process
+- New TAP device (same name)
+- DHCP reservation (same MAC → IP mapping)
+- SSH forwarding rules (same port → IP mapping)
+- Machine handle (new entry in map)
+
+## Wake-on-Request Integration
+
+Snapshots are central to Hatch's serverless pattern. See [Wake-on-Request](/concepts/wake-on-request) for details on:
+
+- Automatic snapshot on idle timeout
+- Transparent restore on HTTP request
+- Transparent restore on SSH connection
+- Concurrent wake request serialization
+
+## Performance Characteristics
+
+<CardGroup cols={2}>
+  <Card title="Snapshot Time" icon="clock">
+    **2-5 seconds** for typical VM (1 GB RAM, 10 GB disk)
+    - Pause: ~10ms
+    - Memory dump: ~500ms-1s
+    - Disk delta: ~500ms-2s
+    - S3 upload: 1-3s (depends on bandwidth)
+  </Card>
+  
+  <Card title="Restore Time" icon="clock">
+    **3-8 seconds** for typical VM
+    - S3 download: 1-3s
+    - Disk reconstruction: ~500ms-1s
+    - Network setup: ~100ms
+    - Resume execution: ~10ms
+    - Guest network ready: ~1-2s (cloud-init, DHCP)
+  </Card>
+</CardGroup>
+
+<Note>
+  For HTTP requests, users experience this as slow first-byte time. For SSH, it appears as a slow handshake. Subsequent requests hit the running VM with normal latency.
+</Note>
+
+## Storage Requirements
+
+For a VM with 1 GB RAM and 10 GB rootfs:
+
+- **vmstate**: ~100 KB
+- **memory.gz**: ~400-600 MB (depending on memory usage)
+- **disk.delta.gz**: ~50-500 MB (depending on disk changes)
+
+**Total**: ~500 MB - 1.1 GB per snapshot
+
+<Warning>
+  Each snapshot is a full point-in-time capture. Hatch does not currently implement incremental snapshots or deduplication.
+</Warning>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Snapshot fails with 'compute disk delta' error">
+    - Check rsync is installed: `which rsync`
+    - Verify base image path in database matches actual file location
+    - Ensure sufficient disk space in VM work directory
+    - Check VM rootfs is not corrupted: `fsck.ext4 -n /path/to/rootfs.ext4`
+  </Accordion>
+  
+  <Accordion title="Restore fails with 'apply disk delta' error">
+    - Verify S3 download completed (check file size)
+    - Ensure base image hasn't been deleted/moved since snapshot
+    - Check disk space in VM work directory
+    - Try manually: `rsync --read-batch=/path/to/disk.delta /path/to/test.ext4`
+  </Accordion>
+  
+  <Accordion title="Restored VM doesn't get network connectivity">
+    - Verify TAP device exists: `ip link show fctap-<vmid>`
+    - Check DHCP reservation: `cat /data/dhcp/hosts | grep <mac>`
+    - Verify iptables SSH forward rule: `iptables -t nat -L PREROUTING -n | grep <ssh_port>`
+    - Allow 1-2 seconds for guest cloud-init to configure network
+  </Accordion>
+  
+  <Accordion title="S3 upload/download is slow">
+    - Check network bandwidth to S3 endpoint
+    - Consider using a closer S3 region
+    - For local development, use MinIO on same host (no network latency)
+    - Monitor S3 request metrics for throttling
+  </Accordion>
+</AccordionGroup>

@@ -1,0 +1,242 @@
+---
+title: 'Snapshots'
+description: 'Create and restore VM snapshots'
+---
+
+Snapshots capture the full state of a running VM, including memory, disk, and CPU state. Snapshots are stored in S3-compatible storage and can be used to quickly restore VMs to a previous state.
+
+<Note>
+  Snapshot functionality requires S3 configuration. Set the `HATCH_S3_BUCKET`, `HATCH_S3_ENDPOINT`, `HATCH_S3_ACCESS_KEY`, and `HATCH_S3_SECRET_KEY` environment variables.
+</Note>
+
+## Create Snapshot
+
+<api method="POST" path="/vms/{id}/snapshot" />
+
+Create a snapshot of a running VM. The VM's memory, disk, and CPU state are captured and uploaded to S3 storage.
+
+### Path Parameters
+
+<ParamField path="id" type="string" required>
+  The VM ID to snapshot.
+</ParamField>
+
+### Response
+
+<ResponseField name="id" type="string">
+  Unique snapshot identifier (e.g., `snap_abc123`).
+</ResponseField>
+
+<ResponseField name="vm_id" type="string">
+  The ID of the VM that was snapshotted.
+</ResponseField>
+
+<ResponseField name="state_key" type="string">
+  S3 key for the VM state file.
+</ResponseField>
+
+<ResponseField name="memory_key" type="string">
+  S3 key for the memory snapshot file.
+</ResponseField>
+
+<ResponseField name="disk_key" type="string">
+  S3 key for the disk snapshot file.
+</ResponseField>
+
+<ResponseField name="vm_config" type="string">
+  JSON-encoded VM configuration at the time of snapshot.
+</ResponseField>
+
+<ResponseField name="size_bytes" type="integer">
+  Total size of the snapshot in bytes.
+</ResponseField>
+
+<ResponseField name="created_at" type="string">
+  ISO 8601 timestamp when the snapshot was created.
+</ResponseField>
+
+### Example Request
+
+```bash
+curl -X POST http://localhost:8080/vms/vm_abc123def456/snapshot \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+### Example Response
+
+```json
+{
+  "id": "snap_xyz789ghi012",
+  "vm_id": "vm_abc123def456",
+  "state_key": "snapshots/vm_abc123def456/snap_xyz789ghi012/vmstate",
+  "memory_key": "snapshots/vm_abc123def456/snap_xyz789ghi012/memory",
+  "disk_key": "snapshots/vm_abc123def456/snap_xyz789ghi012/disk",
+  "vm_config": "{\"vcpu_count\":2,\"mem_mib\":1024}",
+  "size_bytes": 1073741824,
+  "created_at": "2026-03-06T12:30:00Z"
+}
+```
+
+---
+
+## Restore Snapshot
+
+<api method="POST" path="/vms/{id}/restore" />
+
+Restore a VM from its most recent snapshot. The VM must be in a `snapshotted` state. This operation downloads the snapshot files from S3 and restarts the VM with the restored state.
+
+### Path Parameters
+
+<ParamField path="id" type="string" required>
+  The VM ID to restore.
+</ParamField>
+
+### Response
+
+Returns the restored VM object with state set to `running`.
+
+<ResponseField name="id" type="string">
+  The VM ID.
+</ResponseField>
+
+<ResponseField name="image_id" type="string">
+  The image ID used for this VM.
+</ResponseField>
+
+<ResponseField name="state" type="string">
+  VM state after restoration (typically `running`).
+</ResponseField>
+
+<ResponseField name="vcpu_count" type="integer">
+  Number of virtual CPUs.
+</ResponseField>
+
+<ResponseField name="mem_mib" type="integer">
+  Memory size in MiB.
+</ResponseField>
+
+<ResponseField name="guest_ip" type="string">
+  The guest IP address.
+</ResponseField>
+
+<ResponseField name="guest_mac" type="string">
+  The guest MAC address.
+</ResponseField>
+
+<ResponseField name="tap_name" type="string">
+  The TAP network interface name.
+</ResponseField>
+
+<ResponseField name="ssh_port" type="integer">
+  The host port forwarded to the VM's SSH port.
+</ResponseField>
+
+<ResponseField name="enable_network" type="boolean">
+  Whether networking is enabled.
+</ResponseField>
+
+<ResponseField name="created_at" type="string">
+  Original VM creation timestamp.
+</ResponseField>
+
+<ResponseField name="updated_at" type="string">
+  Timestamp when the VM was last updated (restore time).
+</ResponseField>
+
+### Example Request
+
+```bash
+curl -X POST http://localhost:8080/vms/vm_abc123def456/restore \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+### Example Response
+
+```json
+{
+  "id": "vm_abc123def456",
+  "image_id": "img_default",
+  "state": "running",
+  "vcpu_count": 2,
+  "mem_mib": 1024,
+  "guest_ip": "172.16.0.10",
+  "guest_mac": "02:FC:00:00:00:0A",
+  "tap_name": "tap0",
+  "ssh_port": 16001,
+  "enable_network": true,
+  "created_at": "2026-03-06T12:00:00Z",
+  "updated_at": "2026-03-06T12:35:00Z"
+}
+```
+
+---
+
+## List Snapshots
+
+<api method="GET" path="/vms/{id}/snapshots" />
+
+Retrieve all snapshots for a specific VM.
+
+### Path Parameters
+
+<ParamField path="id" type="string" required>
+  The VM ID.
+</ParamField>
+
+### Response
+
+Returns an array of snapshot objects, ordered by creation date (most recent first).
+
+### Example Request
+
+```bash
+curl http://localhost:8080/vms/vm_abc123def456/snapshots \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+### Example Response
+
+```json
+[
+  {
+    "id": "snap_xyz789ghi012",
+    "vm_id": "vm_abc123def456",
+    "state_key": "snapshots/vm_abc123def456/snap_xyz789ghi012/vmstate",
+    "memory_key": "snapshots/vm_abc123def456/snap_xyz789ghi012/memory",
+    "disk_key": "snapshots/vm_abc123def456/snap_xyz789ghi012/disk",
+    "vm_config": "{\"vcpu_count\":2,\"mem_mib\":1024}",
+    "size_bytes": 1073741824,
+    "created_at": "2026-03-06T12:30:00Z"
+  },
+  {
+    "id": "snap_abc123def456",
+    "vm_id": "vm_abc123def456",
+    "state_key": "snapshots/vm_abc123def456/snap_abc123def456/vmstate",
+    "memory_key": "snapshots/vm_abc123def456/snap_abc123def456/memory",
+    "disk_key": "snapshots/vm_abc123def456/snap_abc123def456/disk",
+    "vm_config": "{\"vcpu_count\":2,\"mem_mib\":1024}",
+    "size_bytes": 1073741824,
+    "created_at": "2026-03-06T12:00:00Z"
+  }
+]
+```
+
+## Snapshot Workflow
+
+<Steps>
+  <Step title="Create a running VM">
+    Use the [Create VM](/api/virtual-machines#create-vm) endpoint to start a new VM.
+  </Step>
+  
+  <Step title="Create a snapshot">
+    When the VM is in a desired state, create a snapshot. The VM state is `snapshotted` after this operation.
+  </Step>
+  
+  <Step title="Restore when needed">
+    Use the restore endpoint to return the VM to the snapshotted state.
+  </Step>
+</Steps>
+
+<Warning>
+  Restoring a snapshot will replace the current VM state entirely. Any changes made since the snapshot was created will be lost.
+</Warning>

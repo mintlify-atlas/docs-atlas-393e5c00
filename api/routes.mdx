@@ -1,0 +1,249 @@
+---
+title: 'Proxy Routes'
+description: 'Manage HTTP proxy routes to VMs'
+---
+
+Proxy routes allow you to expose services running inside VMs via HTTP(S) using subdomains. Each route maps a subdomain to a target port on a VM.
+
+## Create Route
+
+<api method="POST" path="/vms/{id}/routes" />
+
+Create an HTTP proxy route for a VM. The route maps a subdomain (e.g., `myapp.hatch.local`) to a specific port inside the VM.
+
+### Path Parameters
+
+<ParamField path="id" type="string" required>
+  The VM ID to create a route for.
+</ParamField>
+
+### Request Body
+
+<ParamField body="subdomain" type="string">
+  The subdomain to use. Must be lowercase alphanumeric with optional hyphens, max 63 characters. If not provided, a random 12-character subdomain is generated.
+  
+  **Reserved subdomains:** `api`, `www`, `admin`, `app`, `dashboard`, `mail`, `smtp`, `ftp`, `ssh`, `ns1`, `ns2`, `status`, `docs`, `help`, `support`, `billing`, `login`, `auth`, `oauth`, `cdn`, `static`, `assets`, `media`, `hatch`, `console`, `panel`, `grafana`, `prometheus`, `traefik`, `minio`, `postgres`, `db`, `redis`, `internal`.
+</ParamField>
+
+<ParamField body="target_port" type="integer" required>
+  The port inside the VM to forward traffic to. Must be between 1 and 65535.
+</ParamField>
+
+<ParamField body="auto_wake" type="boolean">
+  Whether to automatically wake the VM if it's in a stopped or snapshotted state when a request arrives. Defaults to `true`.
+</ParamField>
+
+### Response
+
+<ResponseField name="id" type="string">
+  Unique route identifier (e.g., `rt_abc123`).
+</ResponseField>
+
+<ResponseField name="vm_id" type="string">
+  The VM ID this route belongs to.
+</ResponseField>
+
+<ResponseField name="subdomain" type="string">
+  The subdomain for this route.
+</ResponseField>
+
+<ResponseField name="target_port" type="integer">
+  The target port inside the VM.
+</ResponseField>
+
+<ResponseField name="auto_wake" type="boolean">
+  Whether auto-wake is enabled.
+</ResponseField>
+
+<ResponseField name="created_at" type="string">
+  ISO 8601 timestamp when the route was created.
+</ResponseField>
+
+<ResponseField name="updated_at" type="string">
+  ISO 8601 timestamp when the route was last updated.
+</ResponseField>
+
+### Example Request
+
+```bash
+curl -X POST http://localhost:8080/vms/vm_abc123def456/routes \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "subdomain": "myapp",
+    "target_port": 8080,
+    "auto_wake": true
+  }'
+```
+
+### Example Response
+
+```json
+{
+  "id": "rt_xyz789ghi012",
+  "vm_id": "vm_abc123def456",
+  "subdomain": "myapp",
+  "target_port": 8080,
+  "auto_wake": true,
+  "created_at": "2026-03-06T13:00:00Z",
+  "updated_at": "2026-03-06T13:00:00Z"
+}
+```
+
+After creating this route, you can access your VM's service at:
+```
+http://myapp.hatch.local:9090
+```
+(assuming default proxy address `:9090` and base domain `hatch.local`)
+
+---
+
+## List Routes for VM
+
+<api method="GET" path="/vms/{id}/routes" />
+
+Retrieve all proxy routes for a specific VM.
+
+### Path Parameters
+
+<ParamField path="id" type="string" required>
+  The VM ID.
+</ParamField>
+
+### Response
+
+Returns an array of route objects, ordered by creation date (most recent first).
+
+### Example Request
+
+```bash
+curl http://localhost:8080/vms/vm_abc123def456/routes \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+### Example Response
+
+```json
+[
+  {
+    "id": "rt_xyz789ghi012",
+    "vm_id": "vm_abc123def456",
+    "subdomain": "myapp",
+    "target_port": 8080,
+    "auto_wake": true,
+    "created_at": "2026-03-06T13:00:00Z",
+    "updated_at": "2026-03-06T13:00:00Z"
+  },
+  {
+    "id": "rt_abc123def456",
+    "vm_id": "vm_abc123def456",
+    "subdomain": "api",
+    "target_port": 3000,
+    "auto_wake": false,
+    "created_at": "2026-03-06T12:45:00Z",
+    "updated_at": "2026-03-06T12:45:00Z"
+  }
+]
+```
+
+---
+
+## Delete Route
+
+<api method="DELETE" path="/routes/{id}" />
+
+Delete a proxy route by its ID.
+
+### Path Parameters
+
+<ParamField path="id" type="string" required>
+  The route ID to delete.
+</ParamField>
+
+### Response
+
+<ResponseField name="status" type="string">
+  Returns `deleted` on success.
+</ResponseField>
+
+### Example Request
+
+```bash
+curl -X DELETE http://localhost:8080/routes/rt_xyz789ghi012 \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+### Example Response
+
+```json
+{
+  "status": "deleted"
+}
+```
+
+---
+
+## Subdomain Validation
+
+### Rules
+
+- Must be lowercase alphanumeric characters with optional hyphens
+- Cannot start or end with a hyphen
+- Maximum length: 63 characters
+- Must match regex: `^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`
+
+### Reserved Subdomains
+
+The following subdomains are reserved and cannot be used:
+
+```
+api, www, admin, app, dashboard, mail, smtp, ftp, ssh,
+ns1, ns2, status, docs, help, support, billing, login,
+auth, oauth, cdn, static, assets, media, hatch, console,
+panel, grafana, prometheus, traefik, minio, postgres,
+db, redis, internal
+```
+
+### Invalid Subdomain Examples
+
+```json
+// Too short or invalid characters
+{ "error": "subdomain must be lowercase alphanumeric with optional hyphens (max 63 chars)" }
+
+// Reserved subdomain
+{ "error": "subdomain \"api\" is reserved" }
+
+// Already in use
+{ "error": "subdomain \"myapp\" is already in use" }
+```
+
+---
+
+## Auto-Wake Feature
+
+When `auto_wake` is enabled (default), the proxy server will automatically restore a VM from a `stopped` or `snapshotted` state when an HTTP request arrives for that route.
+
+<Steps>
+  <Step title="Request arrives">
+    User makes HTTP request to `http://myapp.hatch.local:9090`
+  </Step>
+  
+  <Step title="Proxy checks VM state">
+    If VM is stopped or snapshotted, proxy initiates restore/start.
+  </Step>
+  
+  <Step title="Wait for VM">
+    Proxy waits up to `HATCH_PROXY_WAKE_TIMEOUT` (default: 60s) for VM to become ready.
+  </Step>
+  
+  <Step title="Forward request">
+    Once VM is running, request is forwarded to the target port.
+  </Step>
+</Steps>
+
+<Note>
+  Configure the proxy server using:
+  - `HATCH_PROXY_ADDR` - Proxy listen address (default: `:9090`)
+  - `HATCH_PROXY_BASE_DOMAIN` - Base domain for routes (default: `hatch.local`)
+  - `HATCH_PROXY_WAKE_TIMEOUT` - Maximum time to wait for VM wake (default: `60s`)
+</Note>

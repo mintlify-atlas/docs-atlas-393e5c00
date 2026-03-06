@@ -1,80 +1,203 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quickstart
+description: Get up and running with Hatch in 5 minutes
 ---
 
-## Get started in three steps
+## Prerequisites
 
-Get your documentation site running locally and make your first customization.
-
-### Step 1: Set up your local environment
-
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 2: Deploy your changes
-
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
-
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
-
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 3: Go live
-
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
-
-## Next steps
-
-Now that you have your docs running, explore these key features:
+Before you begin, ensure you have:
 
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Linux with KVM" icon="linux">
+    A Linux machine with KVM virtualization enabled
+  </Card>
+  <Card title="Docker Compose" icon="docker">
+    For running Postgres and MinIO dependencies
+  </Card>
+  <Card title="Go 1.21+" icon="code">
+    Required to build and run hatchd
+  </Card>
+  <Card title="Root Access" icon="key">
+    Needed for network configuration and Firecracker
+  </Card>
 </CardGroup>
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+  Check if KVM is enabled:
+  ```bash
+  ls /dev/kvm && echo "KVM enabled" || echo "KVM not enabled"
+  ```
+</Note>
+
+## Quick Setup
+
+<Steps>
+  <Step title="Install dependencies">
+    Run the provided script to install Firecracker, kernel, rootfs, and system tools:
+
+    ```bash
+    cd hatch
+    sudo ./scripts/install-deps.sh
+    ```
+
+    This script will:
+    - Install dnsmasq, e2fsprogs, iproute2, iptables, and other system packages
+    - Download and install the latest Firecracker binary
+    - Download a compatible Linux kernel
+    - Download Ubuntu Noble cloud image (with cloud-init support)
+    - Enable IP forwarding
+    - Print environment variables to add to your `.env` file
+  </Step>
+
+  <Step title="Configure environment">
+    Copy the example environment file and update with the paths from the install script:
+
+    ```bash
+    cp .env.example .env
+    ```
+
+    The install script will output variables like:
+    ```bash
+    HATCH_FIRECRACKER_BIN=/usr/local/bin/firecracker
+    HATCH_DEFAULT_KERNEL_PATH=/root/firecracker/vmlinux-5.10
+    HATCH_DEFAULT_ROOTFS_PATH=/root/firecracker/ubuntu-noble-rootfs.ext4
+    ```
+
+    Add these to your `.env` file.
+  </Step>
+
+  <Step title="Start services">
+    Launch Postgres and MinIO with Docker Compose:
+
+    ```bash
+    docker compose up -d
+    ```
+
+    This starts:
+    - **Postgres** on `localhost:5432` (database for VM metadata)
+    - **MinIO** on `localhost:9000` (S3-compatible storage for snapshots)
+    - **MinIO Console** on `localhost:9001`
+  </Step>
+
+  <Step title="Run hatchd">
+    Start the Hatch daemon:
+
+    ```bash
+    sudo go run ./cmd/hatchd
+    ```
+
+    You should see logs indicating:
+    - Configuration loaded
+    - Database connected
+    - Default image seeded
+    - API server listening on `:8080`
+    - Reverse proxy listening on `:9090`
+  </Step>
+</Steps>
+
+## Create Your First VM
+
+Now that Hatch is running, let's create a VM with network access and SSH enabled.
+
+<Warning>
+  Replace `<your-public-key>` with your actual SSH public key (from `~/.ssh/id_rsa.pub` or `~/.ssh/id_ed25519.pub`)
+</Warning>
+
+```bash
+curl -X POST localhost:8080/vms \
+  -H 'content-type: application/json' \
+  -d '{
+    "enable_network": true,
+    "user_data": "#cloud-config\nusers:\n  - name: hatch\n    groups: [sudo]\n    shell: /bin/bash\n    sudo: [\"ALL=(ALL) NOPASSWD:ALL\"]\n    ssh_authorized_keys:\n      - <your-public-key>"
+  }'
+```
+
+### Response
+
+The API will return VM details including:
+
+```json
+{
+  "id": "vm-abc123",
+  "state": "running",
+  "guest_ip": "172.16.0.10",
+  "guest_mac": "aa:bb:cc:dd:ee:ff",
+  "ssh_port": 16000,
+  "vcpu_count": 1,
+  "memory_mb": 512,
+  "created_at": "2026-03-06T10:30:00Z"
+}
+```
+
+<Note>
+  The VM boots with cloud-init, so it may take 10-20 seconds for the SSH server to be ready.
+</Note>
+
+## Connect via SSH
+
+Using the `ssh_port` from the response, connect to your VM:
+
+```bash
+ssh -p 16000 hatch@<host-ip>
+```
+
+For local testing:
+
+```bash
+ssh -p 16000 hatch@localhost
+```
+
+You should now be inside your microVM with full shell access.
+
+## What's Next?
+
+<CardGroup cols={2}>
+  <Card title="Installation Guide" icon="book" href="/installation">
+    Learn about all configuration options and advanced setup
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/overview">
+    Explore all available API endpoints
+  </Card>
+  <Card title="Networking" icon="network-wired" href="/concepts/networking">
+    Understand how Hatch networking works
+  </Card>
+  <Card title="Snapshots" icon="camera" href="/concepts/snapshots">
+    Learn about snapshot/restore and wake-on-request
+  </Card>
+</CardGroup>
+
+## Common Commands
+
+### List all VMs
+
+```bash
+curl localhost:8080/vms
+```
+
+### Get VM details
+
+```bash
+curl localhost:8080/vms/{id}
+```
+
+### Stop a VM
+
+```bash
+curl -X POST localhost:8080/vms/{id}/stop
+```
+
+### Snapshot a VM
+
+```bash
+curl -X POST localhost:8080/vms/{id}/snapshot
+```
+
+### Delete a VM
+
+```bash
+curl -X DELETE localhost:8080/vms/{id}
+```
+
+<Note>
+  For full API documentation, see the [API Reference](/api-reference) section.
 </Note>

@@ -1,0 +1,120 @@
+---
+title: Introduction
+description: A Firecracker-based microVM platform designed for agentic workloads
+---
+
+## What is Hatch?
+
+Hatch is a wrapper around Firecracker for spinning up microVMs, designed for agentic workloads. It provides a REST API for lifecycle management, wake-on-request, snapshot/restore for idle VMs, and subdomain-based reverse proxy.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get up and running with Hatch in minutes
+  </Card>
+  <Card title="Installation" icon="download" href="/installation">
+    Detailed setup and configuration guide
+  </Card>
+</CardGroup>
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="REST API" icon="code">
+    Full lifecycle management via HTTP API - create, stop, snapshot, restore, and delete VMs with simple curl commands
+  </Card>
+  <Card title="Wake-on-Request" icon="bolt">
+    Freeze idle VMs to zero compute and wake them transparently on HTTP requests or SSH connections
+  </Card>
+  <Card title="Snapshot/Restore" icon="camera">
+    Save VM state to S3-compatible storage and restore VMs to exactly where they were paused
+  </Card>
+  <Card title="Subdomain Routing" icon="globe">
+    Route HTTP traffic to VMs by subdomain with automatic wake for snapshotted instances
+  </Card>
+  <Card title="SSH Forwarding" icon="terminal">
+    Dedicated host ports for SSH access with automatic wake-on-SSH for snapshotted VMs
+  </Card>
+  <Card title="Idle Auto-Snapshot" icon="clock">
+    Automatically snapshot idle VMs to save compute resources
+  </Card>
+</CardGroup>
+
+## Architecture Overview
+
+Hatch orchestrates Firecracker microVMs with a full networking stack, reverse proxy, and snapshot management.
+
+![Hatch Architecture](/images/architecture.png)
+
+### Core Components
+
+**VM Manager**  
+Manages the Firecracker process lifecycle, networking setup (bridge, TAP devices), and resource allocation.
+
+**API Server** (`:8080`)  
+HTTP API for VM lifecycle operations - create, list, stop, delete, snapshot, restore, and route management.
+
+**Reverse Proxy** (`:9090`)  
+Subdomain-based routing to VMs with wake-on-request support. Requests to `my-agent.hatch.local` are proxied to the corresponding VM.
+
+**SSH Gateway**  
+Port forwarding for SSH access with wake-on-SSH capability. Each networked VM gets a dedicated host port.
+
+**Idle Monitor**  
+Background loop that tracks VM activity and automatically snapshots idle VMs to S3.
+
+**Snapshot Storage**  
+S3-compatible storage for VM snapshots (memory, CPU state, and disk delta).
+
+## Use Cases
+
+### Agentic Workloads
+
+Hatch is designed for AI agents that need isolated, ephemeral compute environments:
+
+- **Development agents** that need a full Linux environment to run code and tests
+- **Task automation** requiring isolated execution contexts
+- **Multi-tenant workloads** where each user gets their own VM
+- **On-demand compute** that scales to zero when idle
+
+### Serverless VMs
+
+The wake-on-request pattern enables serverless-style VMs:
+
+- Idle VMs are snapshotted and frozen (zero compute cost)
+- HTTP requests or SSH connections automatically wake VMs
+- VMs resume from exactly where they were paused
+- No cold start - VMs restore with full state intact
+
+## How It Works
+
+<Steps>
+  <Step title="Create a VM">
+    POST to `/vms` with configuration (CPU, memory, network, cloud-init user data)
+  </Step>
+  <Step title="Networking is set up">
+    Hatch creates a TAP device, allocates IP/MAC, configures DHCP, and sets up NAT
+  </Step>
+  <Step title="Firecracker starts the VM">
+    VM boots with cloud-init configuration and connects to the network
+  </Step>
+  <Step title="Access via SSH or HTTP">
+    Connect via dedicated SSH port or register HTTP routes for subdomain access
+  </Step>
+  <Step title="Idle detection">
+    After inactivity timeout, VM is automatically snapshotted to S3 and stopped
+  </Step>
+  <Step title="Wake on next request">
+    Next SSH or HTTP request restores the VM from S3 and forwards the connection
+  </Step>
+</Steps>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Create your first VM in 5 minutes
+  </Card>
+  <Card title="Installation Guide" icon="download" href="/installation">
+    Full installation and configuration details
+  </Card>
+</CardGroup>

@@ -1,0 +1,394 @@
+---
+title: Snapshot & Restore
+description: Save VM state to S3 and restore it on-demand or automatically via auto-wake
+---
+
+Snapshots let you pause a running VM and save its entire state (memory, CPU, disk) to S3 storage. You can restore the snapshot later to resume exactly where you left off.
+
+## How Snapshots Work
+
+Hatch uses Firecracker's snapshot API to create consistent point-in-time captures:
+
+<Steps>
+  <Step title="VM is paused">
+    Firecracker pauses the VM, freezing CPU execution and memory state.
+  </Step>
+
+  <Step title="Snapshot files are created">
+    Three files are generated:
+    - **State file**: CPU and device state (~100 KB)
+    - **Memory file**: Full memory dump (size = VM RAM)
+    - **Disk file**: VM rootfs image (size varies)
+  </Step>
+
+  <Step title="Files uploaded to S3">
+    All three files are uploaded to your configured S3 bucket with unique keys.
+  </Step>
+
+  <Step title="VM state updated">
+    The VM transitions to `snapshotted` state. The Firecracker process is terminated, and host resources (TAP device, SSH forwarding) are cleaned up.
+  </Step>
+</Steps>
+
+<Note>
+  Snapshots are **immutable**. Each snapshot operation creates a new snapshot record. Restoring a snapshot does not delete it.
+</Note>
+
+## Prerequisites: S3 Configuration
+
+Snapshots require S3-compatible storage. Configure Hatch with these environment variables:
+
+```bash
+# AWS S3 (or compatible service)
+export HATCH_S3_ENDPOINT=https://s3.us-east-1.amazonaws.com
+export HATCH_S3_REGION=us-east-1
+export HATCH_S3_BUCKET=hatch-snapshots
+export HATCH_S3_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE
+export HATCH_S3_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+```
+
+<CodeGroup>
+```bash AWS S3
+export HATCH_S3_ENDPOINT=https://s3.amazonaws.com
+export HATCH_S3_REGION=us-west-2
+export HATCH_S3_BUCKET=my-hatch-snapshots
+```
+
+```bash MinIO (self-hosted)
+export HATCH_S3_ENDPOINT=https://minio.example.com
+export HATCH_S3_REGION=us-east-1
+export HATCH_S3_BUCKET=snapshots
+export HATCH_S3_ACCESS_KEY=minioadmin
+export HATCH_S3_SECRET_KEY=minioadmin
+```
+
+```bash Cloudflare R2
+export HATCH_S3_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
+export HATCH_S3_REGION=auto
+export HATCH_S3_BUCKET=hatch-snapshots
+```
+</CodeGroup>
+
+<Warning>
+  **S3 is required for snapshots.** If S3 is not configured, snapshot requests will fail. The API will return an error indicating that snapshot storage is unavailable.
+</Warning>
+
+## Creating a Snapshot
+
+Snapshot a running VM with a single API call:
+
+```bash
+curl -X POST https://api.hatch.example.com/vms/vm-abc123/snapshot \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+**Response:**
+```json
+{
+  "id": "snap-xyz789",
+  "vm_id": "vm-abc123",
+  "state_key": "snapshots/vm-abc123/snap-xyz789.state",
+  "memory_key": "snapshots/vm-abc123/snap-xyz789.mem",
+  "disk_key": "snapshots/vm-abc123/snap-xyz789.ext4",
+  "vm_config": "{\"vcpu_count\":2,\"mem_mib\":2048,...}",
+  "size_bytes": 2147483648,
+  "created_at": "2026-03-06T14:30:00Z"
+}
+```
+
+<Tip>
+  Snapshots are **non-blocking** from the API perspective, but the VM will be paused during the snapshot process (typically 1-5 seconds). For VMs with large memory allocations, upload time may be longer.
+</Tip>
+
+## Listing Snapshots
+
+View all snapshots for a specific VM:
+
+```bash
+curl https://api.hatch.example.com/vms/vm-abc123/snapshots \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+**Response:**
+```json
+[
+  {
+    "id": "snap-xyz789",
+    "vm_id": "vm-abc123",
+    "state_key": "snapshots/vm-abc123/snap-xyz789.state",
+    "memory_key": "snapshots/vm-abc123/snap-xyz789.mem",
+    "disk_key": "snapshots/vm-abc123/snap-xyz789.ext4",
+    "size_bytes": 2147483648,
+    "created_at": "2026-03-06T14:30:00Z"
+  },
+  {
+    "id": "snap-abc456",
+    "vm_id": "vm-abc123",
+    "state_key": "snapshots/vm-abc123/snap-abc456.state",
+    "memory_key": "snapshots/vm-abc123/snap-abc456.mem",
+    "disk_key": "snapshots/vm-abc123/snap-abc456.ext4",
+    "size_bytes": 2147483648,
+    "created_at": "2026-03-06T10:15:00Z"
+  }
+]
+```
+
+<Note>
+  Snapshots are returned in **descending order** by creation time (newest first).
+</Note>
+
+## Restoring from Snapshot
+
+Restore a snapshotted VM to its previous running state:
+
+```bash
+curl -X POST https://api.hatch.example.com/vms/vm-abc123/restore \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+**How restore works:**
+
+<Steps>
+  <Step title="Latest snapshot is identified">
+    Hatch retrieves the most recent snapshot for the VM from the database.
+  </Step>
+
+  <Step title="Snapshot files are downloaded from S3">
+    The state, memory, and disk files are downloaded to the host.
+  </Step>
+
+  <Step title="Network resources are recreated">
+    TAP device, IP allocation, DHCP reservation, and SSH forwarding are set up (using the same IPs/ports as before).
+  </Step>
+
+  <Step title="Firecracker loads the snapshot">
+    A new Firecracker process is started with the `--snapshot` flag, loading the saved state.
+  </Step>
+
+  <Step title="VM resumes execution">
+    The VM instantly resumes from the exact instruction where it was paused. All processes, network connections, and memory state are restored.
+  </Step>
+</Steps>
+
+**Response:**
+```json
+{
+  "id": "vm-abc123",
+  "state": "running",
+  "vcpu_count": 2,
+  "mem_mib": 2048,
+  "guest_ip": "192.168.241.10",
+  "ssh_port": 2200,
+  "updated_at": "2026-03-06T15:00:00Z"
+}
+```
+
+<Tip>
+  **Restore is fast!** Since memory and CPU state are preserved, the VM doesn't go through a boot process. Typical restore time is 2-10 seconds depending on memory size.
+</Tip>
+
+## Automatic Restore (Auto-Wake)
+
+Hatch can **automatically restore** snapshotted VMs when they receive HTTP traffic via the reverse proxy. See the [Reverse Proxy guide](/guides/reverse-proxy#auto-wake-behavior) for details.
+
+When a proxy route has `auto_wake: true` (default):
+1. Incoming HTTP request hits the proxy
+2. Proxy detects VM is in `snapshotted` state
+3. VM is automatically restored from the latest snapshot
+4. Request is forwarded once VM is `running`
+
+This enables **serverless-style workflows** where VMs are paused when idle and wake instantly on demand.
+
+## Snapshot Storage Format
+
+Snapshots are stored in S3 with this key structure:
+
+```
+snapshots/{vm_id}/{snapshot_id}.state
+snapshots/{vm_id}/{snapshot_id}.mem
+snapshots/{vm_id}/{snapshot_id}.ext4
+```
+
+**Example:**
+```
+snapshots/vm-abc123/snap-xyz789.state
+snapshots/vm-abc123/snap-xyz789.mem
+snapshots/vm-abc123/snap-xyz789.ext4
+```
+
+### File Sizes
+
+| File | Typical Size | Description |
+|------|--------------|-------------|
+| `.state` | ~100 KB | CPU registers, device state, metadata |
+| `.mem` | = VM RAM | Full memory dump (e.g., 2 GB for 2048 MiB VM) |
+| `.ext4` | Varies | VM rootfs image (compressed size depends on usage) |
+
+<Note>
+  Total snapshot size ≈ VM memory + rootfs size. For a 2 GB RAM VM with a 10 GB rootfs, expect ~12 GB per snapshot.
+</Note>
+
+## Snapshot Lifecycle
+
+### When Snapshots Are Created
+
+1. **Manual snapshots**: Via `POST /vms/{id}/snapshot`
+2. **Idle snapshots**: Automatically by the [idle monitor](/guides/idle-management) when VMs are inactive
+3. **Before deletion**: Optional (not currently implemented)
+
+### When Snapshots Are Deleted
+
+Snapshots are deleted when:
+1. **VM is deleted**: All associated snapshots are removed from S3 and the database
+2. **Manual deletion**: Not currently exposed in the API (future feature)
+
+<Warning>
+  **Deleting a VM deletes all its snapshots!** This is permanent and cannot be undone. Always backup critical snapshots to a separate location if needed.
+</Warning>
+
+## Snapshot Limitations
+
+### Cannot snapshot stopped VMs
+
+Snapshots only work on `running` VMs. If a VM is `stopped` or in `error` state, snapshot requests will fail:
+
+```json
+{
+  "error": "vm is not running: vm-abc123"
+}
+```
+
+### Snapshots are VM-specific
+
+You cannot restore a snapshot to a different VM. Each snapshot contains VM-specific configuration (CPU, memory, network) that must match.
+
+### Network state is not preserved
+
+While TCP connections are restored at the kernel level, most application-level connections (HTTP, SSH, database) will time out during the snapshot period. Design your applications to handle reconnections.
+
+## Best Practices
+
+<Steps>
+  <Step title="Snapshot before risky operations">
+    Before applying system updates, deploying new code, or making configuration changes, create a manual snapshot:
+
+    ```bash
+    curl -X POST https://api.hatch.example.com/vms/vm-abc123/snapshot \
+      -H "Authorization: Bearer YOUR_API_KEY"
+    ```
+  </Step>
+
+  <Step title="Test restore process">
+    Periodically test restoring snapshots to ensure they work correctly:
+
+    ```bash
+    # Snapshot the VM
+    curl -X POST https://api.hatch.example.com/vms/vm-abc123/snapshot \
+      -H "Authorization: Bearer YOUR_API_KEY"
+
+    # Wait for snapshot to complete
+    sleep 10
+
+    # Restore from snapshot
+    curl -X POST https://api.hatch.example.com/vms/vm-abc123/restore \
+      -H "Authorization: Bearer YOUR_API_KEY"
+    ```
+  </Step>
+
+  <Step title="Monitor S3 storage costs">
+    Snapshots consume S3 storage. Monitor your bucket size and implement retention policies:
+
+    ```bash
+    # List all snapshots for a VM
+    curl https://api.hatch.example.com/vms/vm-abc123/snapshots \
+      -H "Authorization: Bearer YOUR_API_KEY"
+    ```
+  </Step>
+
+  <Step title="Use auto-wake for cost savings">
+    Enable auto-wake on proxy routes to automatically snapshot idle VMs and restore them on demand:
+
+    ```bash
+    curl -X POST https://api.hatch.example.com/vms/vm-abc123/routes \
+      -H "Authorization: Bearer YOUR_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "subdomain": "my-app",
+        "target_port": 8080,
+        "auto_wake": true
+      }'
+    ```
+  </Step>
+</Steps>
+
+## Troubleshooting
+
+### Snapshot creation fails
+
+**Error:** `snapshot storage not configured`
+
+**Solution:** Configure S3 environment variables and restart Hatch:
+```bash
+export HATCH_S3_ENDPOINT=https://s3.amazonaws.com
+export HATCH_S3_REGION=us-west-2
+export HATCH_S3_BUCKET=my-snapshots
+export HATCH_S3_ACCESS_KEY=...
+export HATCH_S3_SECRET_KEY=...
+```
+
+### Restore fails
+
+**Error:** `no snapshots found for vm`
+
+**Solution:** Verify snapshots exist:
+```bash
+curl https://api.hatch.example.com/vms/vm-abc123/snapshots \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+**Error:** `failed to download snapshot from S3`
+
+**Solution:** Check S3 credentials and bucket permissions. Ensure the Hatch host can reach the S3 endpoint.
+
+### VM crashes after restore
+
+**Possible causes:**
+1. Snapshot was created while VM was under heavy load
+2. S3 file corruption during upload/download
+3. Incompatible Firecracker or kernel version
+
+**Solution:** Create a new snapshot and test restore. If issues persist, recreate the VM from scratch.
+
+## Advanced: VM Configuration in Snapshots
+
+Each snapshot stores VM configuration in the `vm_config` field (JSON string):
+
+```json
+{
+  "vcpu_count": 2,
+  "mem_mib": 2048,
+  "guest_ip": "192.168.241.10",
+  "guest_mac": "02:fc:00:00:00:01",
+  "ssh_port": 2200,
+  "enable_network": true
+}
+```
+
+During restore, Hatch uses this configuration to recreate the VM with identical settings.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Idle Management" icon="clock" href="/guides/idle-management">
+    Configure automatic snapshots for idle VMs
+  </Card>
+  <Card title="Reverse Proxy" icon="route" href="/guides/reverse-proxy">
+    Enable auto-wake for on-demand VM restoration
+  </Card>
+  <Card title="Creating VMs" icon="plus" href="/guides/creating-vms">
+    Learn about VM lifecycle and states
+  </Card>
+  <Card title="Network Setup" icon="network-wired" href="/guides/networking-setup">
+    Understand networking behavior after restore
+  </Card>
+</CardGroup>

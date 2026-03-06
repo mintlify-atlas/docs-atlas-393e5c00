@@ -1,0 +1,382 @@
+---
+title: Network Configuration
+description: Configure networking, IP allocation, and internet access for your microVMs
+---
+
+Hatch provides automatic networking for VMs using Linux bridges, TAP devices, and DHCP. This guide covers network configuration and troubleshooting.
+
+## How Hatch Networking Works
+
+Hatch creates a virtualized network infrastructure for your VMs:
+
+<Steps>
+  <Step title="Bridge Network">
+    A Linux bridge (default: `fcbridge`) connects all VM TAP devices. The bridge is configured with a CIDR range (e.g., `192.168.241.1/24`).
+  </Step>
+
+  <Step title="TAP Devices">
+    Each VM gets a dedicated TAP device (e.g., `fctap-vm-abc12`) attached to the bridge, providing layer-2 connectivity.
+  </Step>
+
+  <Step title="DHCP Server">
+    A dnsmasq instance runs on the bridge, assigning IPs to VMs via DHCP. MAC-to-IP reservations ensure consistent addressing.
+  </Step>
+
+  <Step title="SSH Port Forwarding">
+    iptables DNAT rules forward host ports (2200-2299) to VM port 22, enabling SSH access from outside the bridge network.
+  </Step>
+</Steps>
+
+## Enabling Networking on VMs
+
+Networking is **enabled by default**. When you create a VM, Hatch automatically:
+
+```bash
+curl -X POST https://api.hatch.example.com/vms \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+**Automatic setup includes:**
+- IP allocation from the bridge CIDR pool
+- Random MAC address generation
+- TAP device creation and bridge attachment
+- DHCP reservation for the VM
+- SSH port forwarding (e.g., host:2200 → guest:22)
+
+<Tip>
+  By default, `enable_network` is `true`. You only need to set it explicitly if disabling networking.
+</Tip>
+
+## Custom IP Assignment
+
+You can assign a static IP within the bridge CIDR range:
+
+```bash
+curl -X POST https://api.hatch.example.com/vms \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "guest_ip": "192.168.241.50",
+    "vcpu_count": 2,
+    "mem_mib": 2048
+  }'
+```
+
+**Response includes the assigned IP:**
+```json
+{
+  "id": "vm-xyz789",
+  "guest_ip": "192.168.241.50",
+  "guest_mac": "02:fc:00:00:00:32",
+  "tap_name": "fctap-vm-xyz78",
+  "ssh_port": 2200,
+  "state": "running"
+}
+```
+
+<Warning>
+  Custom IPs must:
+  - Fall within the configured bridge CIDR (default: `192.168.241.0/24`)
+  - Not conflict with existing VM IPs
+  - Avoid the bridge gateway IP (`.1`)
+</Warning>
+
+## Custom MAC Address
+
+For advanced scenarios (e.g., license keys tied to MAC), specify a static MAC:
+
+```bash
+curl -X POST https://api.hatch.example.com/vms \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "guest_mac": "02:fc:00:11:22:33",
+    "vcpu_count": 1,
+    "mem_mib": 512
+  }'
+```
+
+<Note>
+  Use the locally administered MAC prefix `02:fc:` to avoid conflicts with physical hardware.
+</Note>
+
+## Cloud-Init Network Configuration
+
+Hatch automatically injects cloud-init data during VM creation. For custom network settings inside the guest:
+
+```yaml
+#cloud-config
+network:
+  version: 2
+  ethernets:
+    eth0:
+      dhcp4: true
+      dhcp4-overrides:
+        use-dns: true
+        use-routes: true
+```
+
+**Create VM with network config:**
+```bash
+curl -X POST https://api.hatch.example.com/vms \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_data": "#cloud-config\nnetwork:\n  version: 2\n  ethernets:\n    eth0:\n      dhcp4: true",
+    "vcpu_count": 1,
+    "mem_mib": 512
+  }'
+```
+
+<Tip>
+  Cloud-init network configuration is optional. By default, VMs use DHCP to obtain the IP assigned via the DHCP reservation.
+</Tip>
+
+## DNS and Internet Access
+
+VMs automatically get DNS resolution and internet access through the host's network:
+
+<Steps>
+  <Step title="DHCP provides DNS servers">
+    The dnsmasq DHCP server advertises DNS servers to VMs (typically the bridge gateway IP).
+  </Step>
+
+  <Step title="Bridge is masqueraded">
+    The host enables IP forwarding and NAT (masquerade) for the bridge network, allowing VMs to reach the internet.
+  </Step>
+
+  <Step title="Test connectivity from VM">
+    SSH into the VM and verify:
+
+    ```bash
+    # Test DNS resolution
+    nslookup google.com
+
+    # Test internet connectivity
+    curl -I https://google.com
+    ```
+  </Step>
+</Steps>
+
+### Configuring Custom DNS
+
+To use specific DNS servers in your VMs, configure cloud-init:
+
+```yaml
+#cloud-config
+write_files:
+  - path: /etc/systemd/resolved.conf.d/dns.conf
+    content: |
+      [Resolve]
+      DNS=1.1.1.1 8.8.8.8
+      FallbackDNS=1.0.0.1 8.8.4.4
+
+runcmd:
+  - systemctl restart systemd-resolved
+```
+
+## Disabling Networking
+
+For isolated compute workloads that don't need network access:
+
+```bash
+curl -X POST https://api.hatch.example.com/vms \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "enable_network": false,
+    "vcpu_count": 4,
+    "mem_mib": 8192
+  }'
+```
+
+**VMs without networking will NOT have:**
+- `guest_ip` or `guest_mac` fields
+- TAP device or bridge attachment
+- DHCP reservation
+- SSH port forwarding
+- Internet access
+
+<Warning>
+  Without networking, you cannot SSH into the VM or access services running inside it. This is useful for batch processing or workloads that communicate via Firecracker's vsock interface.
+</Warning>
+
+## Network Information Fields
+
+When networking is enabled, the VM object includes:
+
+| Field | Example | Description |
+|-------|---------|-------------|
+| `guest_ip` | `192.168.241.10` | VM's IP address on the bridge network |
+| `guest_mac` | `02:fc:00:00:00:01` | VM's MAC address |
+| `tap_name` | `fctap-vm-abc12` | Host TAP device name |
+| `ssh_port` | `2200` | Host port forwarded to VM port 22 |
+| `enable_network` | `true` | Whether networking is enabled |
+
+**Example response:**
+```json
+{
+  "id": "vm-abc123",
+  "state": "running",
+  "guest_ip": "192.168.241.10",
+  "guest_mac": "02:fc:00:00:00:01",
+  "tap_name": "fctap-vm-abc12",
+  "ssh_port": 2200,
+  "enable_network": true
+}
+```
+
+## SSH Access
+
+Hatch automatically sets up SSH port forwarding for networked VMs:
+
+<CodeGroup>
+```bash Direct SSH
+ssh ubuntu@hatch-host.example.com -p 2200
+```
+
+```bash Using VM IP (from bridge network)
+# Only works from the host or other VMs
+ssh ubuntu@192.168.241.10
+```
+
+```bash With SSH key from cloud-init
+ssh -i ~/.ssh/vm_key ubuntu@hatch-host.example.com -p 2200
+```
+</CodeGroup>
+
+<Note>
+  SSH port forwarding is restricted to the CIDR configured in `HATCH_SSH_ALLOWED_CIDR`. By default, this allows connections from anywhere (`0.0.0.0/0`).
+</Note>
+
+## Troubleshooting Network Issues
+
+### VM has no IP address
+
+**Symptoms:** `guest_ip` is empty or `null` in API response
+
+**Possible causes:**
+1. Networking is disabled (`enable_network: false`)
+2. IP allocation pool is exhausted
+3. DHCP server failed to start
+
+**Solutions:**
+```bash
+# Check if networking is enabled
+curl https://api.hatch.example.com/vms/vm-abc123 \
+  -H "Authorization: Bearer YOUR_API_KEY" | jq '.enable_network'
+
+# Verify bridge exists on host
+ip addr show fcbridge
+
+# Check DHCP server status (dnsmasq)
+ps aux | grep dnsmasq
+```
+
+### Cannot SSH into VM
+
+**Symptoms:** Connection refused or timeout when connecting to SSH port
+
+**Possible causes:**
+1. VM is not in `running` state
+2. Firewall blocking SSH port
+3. iptables rule not created
+4. SSH daemon not running in guest
+
+**Solutions:**
+```bash
+# Verify VM state
+curl https://api.hatch.example.com/vms/vm-abc123 \
+  -H "Authorization: Bearer YOUR_API_KEY" | jq '.state'
+
+# Check iptables DNAT rule
+sudo iptables -t nat -L PREROUTING -n -v | grep 2200
+
+# Test connectivity to VM IP from host
+ping -c 3 192.168.241.10
+
+# Check SSH port from host
+telnet 192.168.241.10 22
+```
+
+### VM has no internet access
+
+**Symptoms:** VM can ping bridge gateway but not external IPs
+
+**Possible causes:**
+1. IP forwarding disabled on host
+2. Missing NAT/masquerade rule
+3. Host firewall blocking forwarded traffic
+
+**Solutions:**
+```bash
+# Enable IP forwarding (host)
+echo 1 | sudo tee /proc/sys/net/ipv4/ip_forward
+
+# Check masquerade rule
+sudo iptables -t nat -L POSTROUTING -n -v | grep MASQUERADE
+
+# Add masquerade if missing
+sudo iptables -t nat -A POSTROUTING -s 192.168.241.0/24 -j MASQUERADE
+
+# Test from VM
+ssh ubuntu@hatch-host.example.com -p 2200
+ping -c 3 8.8.8.8
+curl -I https://google.com
+```
+
+### DHCP not assigning IP to VM
+
+**Symptoms:** VM starts but doesn't receive IP via DHCP
+
+**Possible causes:**
+1. dnsmasq not running
+2. MAC/IP reservation missing
+3. DHCP lease file corrupted
+
+**Solutions:**
+```bash
+# Check dnsmasq configuration
+cat /var/lib/hatch/dhcp/dnsmasq.conf
+
+# Verify MAC reservation exists
+grep "02:fc:00:00:00:01" /var/lib/hatch/dhcp/dnsmasq.conf
+
+# Restart DHCP server (requires Hatch restart)
+sudo systemctl restart hatch
+```
+
+## Network Configuration Environment Variables
+
+These variables control Hatch's network behavior:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HATCH_BRIDGE_NAME` | `fcbridge` | Name of the Linux bridge |
+| `HATCH_BRIDGE_CIDR` | `192.168.241.1/24` | Bridge network CIDR |
+| `HATCH_SSH_ALLOWED_CIDR` | `0.0.0.0/0` | CIDR allowed to SSH into VMs |
+| `HATCH_SSH_PORT_MIN` | `2200` | Minimum SSH forwarding port |
+| `HATCH_SSH_PORT_MAX` | `2299` | Maximum SSH forwarding port |
+
+<Tip>
+  Restart Hatch after changing network configuration variables. Hatch reconciles network state on startup, cleaning up stale TAP devices and iptables rules.
+</Tip>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Creating VMs" icon="plus" href="/guides/creating-vms">
+    Learn how to create VMs with custom configurations
+  </Card>
+  <Card title="Reverse Proxy" icon="route" href="/guides/reverse-proxy">
+    Expose VM services via subdomain routing
+  </Card>
+  <Card title="Snapshots" icon="camera" href="/guides/snapshot-restore">
+    Save and restore VM network state
+  </Card>
+  <Card title="Idle Management" icon="clock" href="/guides/idle-management">
+    Understand SSH session detection for idle monitoring
+  </Card>
+</CardGroup>

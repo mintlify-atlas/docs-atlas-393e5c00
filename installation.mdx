@@ -1,0 +1,528 @@
+---
+title: Installation
+description: Detailed setup and configuration guide for Hatch
+---
+
+## System Requirements
+
+<CardGroup cols={2}>
+  <Card title="Operating System" icon="linux">
+    Linux with kernel 4.14+ (required for KVM)
+  </Card>
+  <Card title="CPU" icon="microchip">
+    x86_64 or aarch64 with virtualization support
+  </Card>
+  <Card title="Memory" icon="memory">
+    Minimum 2GB RAM (plus memory for VMs)
+  </Card>
+  <Card title="Storage" icon="hard-drive">
+    10GB+ for base system and VM images
+  </Card>
+</CardGroup>
+
+## Prerequisites Check
+
+### Verify KVM Support
+
+Check if KVM is available and your user has access:
+
+```bash
+ls /dev/kvm && echo "KVM enabled" || echo "KVM not enabled"
+```
+
+If KVM is not enabled:
+
+1. **Check CPU virtualization support:**
+   ```bash
+   # For Intel
+   grep -E 'vmx' /proc/cpuinfo
+   
+   # For AMD
+   grep -E 'svm' /proc/cpuinfo
+   ```
+
+2. **Enable in BIOS/UEFI** if not showing
+
+3. **Load KVM modules:**
+   ```bash
+   sudo modprobe kvm
+   sudo modprobe kvm_intel  # or kvm_amd
+   ```
+
+### Install Required Tools
+
+<Tabs>
+  <Tab title="Ubuntu/Debian">
+    ```bash
+    sudo apt-get update
+    sudo apt-get install -y git curl wget docker.io docker-compose-plugin
+    ```
+  </Tab>
+  <Tab title="RHEL/CentOS">
+    ```bash
+    sudo dnf install -y git curl wget docker docker-compose
+    sudo systemctl enable --now docker
+    ```
+  </Tab>
+  <Tab title="Arch Linux">
+    ```bash
+    sudo pacman -S git curl wget docker docker-compose
+    sudo systemctl enable --now docker
+    ```
+  </Tab>
+</Tabs>
+
+### Install Go
+
+Hatch requires Go 1.21 or later:
+
+```bash
+# Download Go (replace version as needed)
+wget https://go.dev/dl/go1.22.0.linux-amd64.tar.gz
+
+# Install
+sudo rm -rf /usr/local/go
+sudo tar -C /usr/local -xzf go1.22.0.linux-amd64.tar.gz
+
+# Add to PATH
+echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
+source ~/.bashrc
+
+# Verify
+go version
+```
+
+## Clone Repository
+
+```bash
+git clone https://github.com/ThakerKush/Hatch.git
+cd Hatch
+```
+
+## Install Dependencies
+
+The `install-deps.sh` script automates installation of Firecracker, kernel, rootfs, and system networking tools.
+
+<Warning>
+  This script requires root access and will modify system network settings.
+</Warning>
+
+```bash
+sudo ./scripts/install-deps.sh
+```
+
+### What the Script Does
+
+<Steps>
+  <Step title="Verify environment">
+    - Checks that you're running as root
+    - Verifies Linux operating system
+    - Confirms KVM is available at `/dev/kvm`
+  </Step>
+
+  <Step title="Install system packages">
+    Installs required dependencies via apt:
+    ```bash
+    dnsmasq-base    # DHCP server for VM networking
+    e2fsprogs       # ext4 filesystem tools
+    iproute2        # ip command for network config
+    iptables        # NAT and port forwarding
+    curl wget       # Download tools
+    ca-certificates # SSL support
+    util-linux      # System utilities
+    ```
+  </Step>
+
+  <Step title="Enable IP forwarding">
+    Configures the kernel to forward packets between VMs and the internet:
+    ```bash
+    sysctl -w net.ipv4.ip_forward=1
+    ```
+    Also persists the setting to `/etc/sysctl.conf`
+  </Step>
+
+  <Step title="Download Firecracker">
+    - Fetches the latest Firecracker release for your architecture
+    - Installs binary to `/usr/local/bin/firecracker`
+    - Makes it executable
+  </Step>
+
+  <Step title="Download kernel">
+    - Gets a Firecracker-compatible Linux kernel (5.10+)
+    - Saves to `/root/firecracker/vmlinux-5.10`
+  </Step>
+
+  <Step title="Download rootfs">
+    - Downloads Ubuntu Noble cloud image
+    - Includes cloud-init support for VM configuration
+    - Saves to `/root/firecracker/ubuntu-noble-rootfs.ext4`
+  </Step>
+</Steps>
+
+### Output
+
+The script prints environment variables to add to your `.env` file:
+
+```bash
+HATCH_FIRECRACKER_BIN=/usr/local/bin/firecracker
+HATCH_DEFAULT_KERNEL_PATH=/root/firecracker/vmlinux-5.10
+HATCH_DEFAULT_ROOTFS_PATH=/root/firecracker/ubuntu-noble-rootfs.ext4
+```
+
+## Database Setup
+
+Hatch uses PostgreSQL to store VM metadata, routes, and snapshots.
+
+### Using Docker Compose (Recommended)
+
+The included `docker-compose.yml` provides Postgres and MinIO:
+
+```bash
+docker compose up -d
+```
+
+This starts:
+
+- **Postgres 17** on `localhost:5432`
+  - User: `hatch`
+  - Password: `hatch`
+  - Database: `hatch`
+
+- **MinIO** on `localhost:9000` (S3 API)
+  - Console: `localhost:9001`
+  - Access key: `minioadmin`
+  - Secret key: `minioadmin`
+
+### Manual Postgres Installation
+
+If you prefer not to use Docker:
+
+<Tabs>
+  <Tab title="Ubuntu/Debian">
+    ```bash
+    sudo apt-get install -y postgresql postgresql-contrib
+    sudo systemctl enable --now postgresql
+    
+    # Create database and user
+    sudo -u postgres psql <<EOF
+    CREATE DATABASE hatch;
+    CREATE USER hatch WITH PASSWORD 'hatch';
+    GRANT ALL PRIVILEGES ON DATABASE hatch TO hatch;
+    EOF
+    ```
+  </Tab>
+  <Tab title="RHEL/CentOS">
+    ```bash
+    sudo dnf install -y postgresql-server postgresql-contrib
+    sudo postgresql-setup --initdb
+    sudo systemctl enable --now postgresql
+    
+    # Create database and user
+    sudo -u postgres psql <<EOF
+    CREATE DATABASE hatch;
+    CREATE USER hatch WITH PASSWORD 'hatch';
+    GRANT ALL PRIVILEGES ON DATABASE hatch TO hatch;
+    EOF
+    ```
+  </Tab>
+</Tabs>
+
+## S3 Storage Setup
+
+S3-compatible storage is required for snapshot/restore functionality.
+
+### Using MinIO (Included in Docker Compose)
+
+MinIO is already running if you started `docker compose up -d`.
+
+**Create the snapshots bucket:**
+
+1. Open MinIO Console at `http://localhost:9001`
+2. Login with `minioadmin` / `minioadmin`
+3. Create a bucket named `hatch-snapshots`
+
+Or use the MinIO CLI:
+
+```bash
+# Install mc (MinIO Client)
+wget https://dl.min.io/client/mc/release/linux-amd64/mc
+chmod +x mc
+sudo mv mc /usr/local/bin/
+
+# Configure
+mc alias set local http://localhost:9000 minioadmin minioadmin
+
+# Create bucket
+mc mb local/hatch-snapshots
+```
+
+### Using AWS S3
+
+To use AWS S3 instead of MinIO, update your `.env`:
+
+```bash
+HATCH_S3_ENDPOINT=https://s3.amazonaws.com
+HATCH_S3_BUCKET=your-bucket-name
+HATCH_S3_REGION=us-east-1
+HATCH_S3_ACCESS_KEY=your-access-key
+HATCH_S3_SECRET_KEY=your-secret-key
+```
+
+## Environment Configuration
+
+Create your environment file:
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` with your configuration:
+
+```bash
+# Database
+DATABASE_URL=postgres://hatch:hatch@127.0.0.1:5432/hatch?sslmode=disable
+
+# API Server
+HATCH_HTTP_ADDR=127.0.0.1:8080
+
+# Reverse Proxy
+HATCH_PROXY_ADDR=127.0.0.1:9090
+HATCH_PROXY_BASE_DOMAIN=hatch.local
+
+# Data directory for VM files
+HATCH_DATA_DIR=/data
+
+# S3 Configuration (MinIO)
+HATCH_S3_ENDPOINT=http://127.0.0.1:9000
+HATCH_S3_BUCKET=hatch-snapshots
+HATCH_S3_REGION=us-east-1
+HATCH_S3_ACCESS_KEY=minioadmin
+HATCH_S3_SECRET_KEY=minioadmin
+
+# Firecracker paths (from install-deps.sh output)
+HATCH_FIRECRACKER_BIN=/usr/local/bin/firecracker
+HATCH_DEFAULT_KERNEL_PATH=/root/firecracker/vmlinux-5.10
+HATCH_DEFAULT_ROOTFS_PATH=/root/firecracker/ubuntu-noble-rootfs.ext4
+
+# SSH forwarding
+HATCH_SSH_ALLOWED_CIDR=0.0.0.0/0
+
+# Idle timeout for auto-snapshot
+HATCH_IDLE_TIMEOUT=45m
+HATCH_IDLE_CHECK_INTERVAL=15m
+```
+
+### Configuration Reference
+
+| Variable | Description | Default |
+|----------|-------------|--------|
+| `DATABASE_URL` | Postgres connection string | - |
+| `HATCH_HTTP_ADDR` | API server listen address | `127.0.0.1:8080` |
+| `HATCH_PROXY_ADDR` | Reverse proxy listen address | `127.0.0.1:9090` |
+| `HATCH_PROXY_BASE_DOMAIN` | Base domain for subdomain routing | `hatch.local` |
+| `HATCH_DATA_DIR` | Directory for VM data | `/data` |
+| `HATCH_S3_ENDPOINT` | S3 endpoint URL | - |
+| `HATCH_S3_BUCKET` | S3 bucket name | `hatch-snapshots` |
+| `HATCH_S3_REGION` | S3 region | `us-east-1` |
+| `HATCH_S3_ACCESS_KEY` | S3 access key | - |
+| `HATCH_S3_SECRET_KEY` | S3 secret key | - |
+| `HATCH_FIRECRACKER_BIN` | Path to Firecracker binary | - |
+| `HATCH_DEFAULT_KERNEL_PATH` | Default kernel path | - |
+| `HATCH_DEFAULT_ROOTFS_PATH` | Default rootfs path | - |
+| `HATCH_SSH_ALLOWED_CIDR` | CIDR for SSH access | `0.0.0.0/0` |
+| `HATCH_IDLE_TIMEOUT` | Time before auto-snapshot | `45m` |
+| `HATCH_IDLE_CHECK_INTERVAL` | Idle check frequency | `15m` |
+
+<Note>
+  If `HATCH_S3_ENDPOINT` is not set, snapshot/restore features will be disabled.
+</Note>
+
+## Running Hatchd
+
+Start the Hatch daemon:
+
+```bash
+sudo go run ./cmd/hatchd
+```
+
+<Note>
+  Root access is required for network configuration (bridge, TAP devices, iptables).
+</Note>
+
+### Expected Output
+
+You should see structured JSON logs indicating:
+
+```json
+{"level":"info","msg":"configuration loaded","http_addr":"127.0.0.1:8080","proxy_addr":"127.0.0.1:9090"}
+{"level":"info","msg":"default image seeded","id":"default","kernel":"/root/firecracker/vmlinux-5.10"}
+{"level":"info","msg":"S3 snapshot storage enabled","bucket":"hatch-snapshots"}
+{"level":"info","msg":"API server listening","addr":"127.0.0.1:8080"}
+{"level":"info","msg":"reverse proxy listening","addr":"127.0.0.1:9090","base_domain":"hatch.local"}
+```
+
+### Build for Production
+
+For production use, build a binary:
+
+```bash
+go build -o hatchd ./cmd/hatchd
+sudo ./hatchd
+```
+
+### Run as a Systemd Service
+
+Create `/etc/systemd/system/hatchd.service`:
+
+```ini
+[Unit]
+Description=Hatch MicroVM Platform
+After=network.target docker.service postgresql.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/hatch
+EnvironmentFile=/opt/hatch/.env
+ExecStart=/opt/hatch/hatchd
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable hatchd
+sudo systemctl start hatchd
+sudo systemctl status hatchd
+```
+
+## Verification
+
+### Health Check
+
+```bash
+curl localhost:8080/healthz
+```
+
+Expected response:
+
+```json
+{
+  "status": "healthy",
+  "vm_count": 0,
+  "route_count": 0
+}
+```
+
+### Create Test VM
+
+Create a simple VM to verify everything works:
+
+```bash
+curl -X POST localhost:8080/vms \
+  -H 'content-type: application/json' \
+  -d '{
+    "enable_network": true,
+    "user_data": "#cloud-config\nusers:\n  - name: test\n    groups: [sudo]\n    shell: /bin/bash\n    sudo: [\"ALL=(ALL) NOPASSWD:ALL\"]\n    ssh_authorized_keys:\n      - '"$(cat ~/.ssh/id_rsa.pub)"'"
+  }'
+```
+
+### Verify Networking
+
+Check that the bridge was created:
+
+```bash
+ip addr show fcbr0
+```
+
+You should see the bridge interface with IP `172.16.0.1`.
+
+### Check Logs
+
+Monitor hatchd logs for any errors:
+
+```bash
+# If running in foreground, logs appear in terminal
+
+# If running as systemd service:
+sudo journalctl -u hatchd -f
+```
+
+## Troubleshooting
+
+### KVM Permission Denied
+
+If you see "Permission denied" for `/dev/kvm`:
+
+```bash
+sudo chmod 666 /dev/kvm
+```
+
+Or add your user to the `kvm` group:
+
+```bash
+sudo usermod -aG kvm $USER
+# Log out and back in
+```
+
+### Database Connection Failed
+
+Verify Postgres is running:
+
+```bash
+sudo systemctl status postgresql
+# or for Docker:
+docker ps | grep postgres
+```
+
+Test connection:
+
+```bash
+psql postgres://hatch:hatch@127.0.0.1:5432/hatch?sslmode=disable
+```
+
+### S3 Connection Failed
+
+Verify MinIO is running:
+
+```bash
+docker ps | grep minio
+curl http://localhost:9000/minio/health/live
+```
+
+### Firecracker Not Found
+
+Verify Firecracker is installed and in PATH:
+
+```bash
+which firecracker
+firecracker --version
+```
+
+If not found, re-run the install script:
+
+```bash
+sudo ./scripts/install-deps.sh
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart Guide" icon="rocket" href="/quickstart">
+    Create your first VM
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/overview">
+    Explore all API endpoints
+  </Card>
+  <Card title="Networking Guide" icon="network-wired" href="/concepts/networking">
+    Deep dive into VM networking
+  </Card>
+  <Card title="Snapshots" icon="camera" href="/concepts/snapshots">
+    Learn about snapshot/restore
+  </Card>
+</CardGroup>

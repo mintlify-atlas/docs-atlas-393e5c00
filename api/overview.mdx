@@ -1,0 +1,119 @@
+---
+title: 'API Overview'
+description: 'Introduction to the Hatch REST API'
+---
+
+The Hatch API provides programmatic access to create and manage Firecracker-based microVMs, snapshots, and HTTP proxy routes.
+
+## Base URL
+
+The default API server runs on:
+
+```
+http://localhost:8080
+```
+
+You can configure this via the `HATCH_HTTP_ADDR` environment variable.
+
+## Authentication
+
+All API endpoints require authentication using an API key. The API key is verified against a Better Auth instance.
+
+You can provide your API key in one of two ways:
+
+### Bearer Token (Recommended)
+
+```bash
+curl -H "Authorization: Bearer YOUR_API_KEY" \
+  http://localhost:8080/vms
+```
+
+### X-API-Key Header
+
+```bash
+curl -H "X-API-Key: YOUR_API_KEY" \
+  http://localhost:8080/vms
+```
+
+## Response Format
+
+All responses are JSON-encoded. Successful responses return the requested data with appropriate HTTP status codes.
+
+### Success Response Example
+
+```json
+{
+  "id": "vm_abc123",
+  "state": "running",
+  "vcpu_count": 2,
+  "mem_mib": 1024
+}
+```
+
+## Error Responses
+
+Errors return a JSON object with an `error` field:
+
+```json
+{
+  "error": "not found"
+}
+```
+
+### HTTP Status Codes
+
+| Status Code | Description |
+|-------------|-------------|
+| 200 | Success |
+| 201 | Created (for POST requests) |
+| 400 | Bad Request - invalid parameters |
+| 401 | Unauthorized - missing or invalid API key |
+| 404 | Not Found - resource doesn't exist |
+| 405 | Method Not Allowed |
+| 409 | Conflict - resource already exists |
+| 500 | Internal Server Error |
+
+## Common Headers
+
+All requests should include:
+
+```
+Authorization: Bearer YOUR_API_KEY
+Content-Type: application/json
+```
+
+## Rate Limiting
+
+Currently, there is no rate limiting enforced at the API level. However, be mindful of system resources when creating VMs.
+
+## Quick Example
+
+Create a new microVM:
+
+```bash
+curl -X POST http://localhost:8080/vms \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vcpu_count": 2,
+    "mem_mib": 1024,
+    "enable_network": true
+  }'
+```
+
+Response:
+
+```json
+{
+  "id": "vm_abc123",
+  "image_id": "img_default",
+  "state": "running",
+  "vcpu_count": 2,
+  "mem_mib": 1024,
+  "guest_ip": "172.16.0.10",
+  "ssh_port": 16001,
+  "enable_network": true,
+  "created_at": "2026-03-06T12:00:00Z",
+  "updated_at": "2026-03-06T12:00:00Z"
+}
+```
